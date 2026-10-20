@@ -1,0 +1,8 @@
+# Versions are bounded to avoid untested major-version upgrades in the prototype.
+torch>=2.5,<3
+transformers>=4.48,<5
+accelerate>=1.2,<2
+faster-whisper>=1.1,<2
+sounddevice>=0.5,<1
+numpy>=1.26,<3
+pyttsx3>=2.98,<3
