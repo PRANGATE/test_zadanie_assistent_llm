@@ -1,9 +1,11 @@
 import threading
+import re
 
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from .config import MAX_RECORD_SECONDS, SAMPLE_RATE, STT_MODEL
+from .engine import speech_friendly_text
 
 
 class Voice:
@@ -53,7 +55,7 @@ class Voice:
                             engine.setProperty("voice", voice.id)
                             break
                     engine.setProperty("rate", 180)
-                    engine.say(text)
+                    engine.say(speech_friendly_text(text))
                     engine.runAndWait()
                 finally:
                     engine.stop()

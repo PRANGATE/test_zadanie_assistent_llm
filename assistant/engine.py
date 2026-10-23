@@ -5,6 +5,15 @@ from .database import Repository
 
 KIND_RU = {"task": "задача", "reminder": "напоминание", "meeting": "встреча"}
 STATUS_RU = {"open": "активна", "done": "выполнена"}
+MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+def speech_friendly_text(text):
+    """Remove database IDs and make the spoken answer less technical."""
+    text = re.sub(r"(?<!\w)#\s*\d+\s*", "", str(text))
+    if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text):
+        text = re.sub(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})", r"\3.\2.\1, \4", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 WEEKDAYS = {
     "понедельник": 0, "понедельника": 0, "понедельнику": 0,
     "вторник": 1, "вторника": 1, "вторнику": 1,
@@ -91,24 +100,37 @@ class AssistantEngine:
                 return (now + timedelta(hours=n)).replace(second=0, microsecond=0).isoformat(timespec="minutes")
             day = (now + timedelta(days=n)).date()
 
-        clock_match = re.search(r"\bв\s*(\d{1,2}):(\d{2})\b|\b(\d{1,2}):(\d{2})\b|\bв\s*(\d{1,2})(?:\s+(утра|дня|вечера|ночи))?\b|\b(\d{1,2})\s*(утра|дня|вечера|ночи)\b", text)
+        # Explicit numeric time, including colloquial forms such as "на 15 часов".
+        clock_match = re.search(
+            r"(?:\bв\s*|\bна\s*)?(\d{1,2}):(\d{2})\b"
+            r"|\b(?:в\s*|на\s*)(\d{1,2})(?:\s*(?:час(?:а|ов)?))?(?:\s+(утра|дня|вечера|ночи))?\b"
+            r"|\b(\d{1,2})\s*(утра|дня|вечера|ночи)\b", text)
         hour = minute = None
         if clock_match:
             groups = clock_match.groups()
             if groups[0] is not None:
                 h, m, suffix = int(groups[0]), int(groups[1]), None
             elif groups[2] is not None:
-                h, m, suffix = int(groups[2]), int(groups[3]), None
-            elif groups[4] is not None:
-                h, m, suffix = int(groups[4]), 0, groups[5]
+                h, m, suffix = int(groups[2]), 0, groups[3]
             else:
-                h, m, suffix = int(groups[6]), 0, groups[7]
+                h, m, suffix = int(groups[4]), 0, groups[5]
             if suffix in {"вечера", "дня"} and 1 <= h <= 11:
                 h += 12
             elif suffix == "ночи" and h == 12:
                 h = 0
             if h <= 23 and m <= 59:
                 hour, minute = h, m
+
+        # Common Russian dayparts. "В обед" means 13:00 by default.
+        if hour is None:
+            if re.search(r"\bв\s+обед\b|\bобед(?:ом)?\b", text):
+                hour, minute = 13, 0
+            elif re.search(r"\bутром\b", text):
+                hour, minute = 9, 0
+            elif re.search(r"\bвечером\b", text):
+                hour, minute = 18, 0
+            elif re.search(r"\bночью\b", text):
+                hour, minute = 22, 0
 
         if day is not None:
             return datetime(day.year, day.month, day.day, hour if hour is not None else 9, minute or 0).isoformat(timespec="minutes")
@@ -117,29 +139,62 @@ class AssistantEngine:
         return None
 
     def _extract_date_phrase(self, user_text):
-        """Conservative date fallback from the original request when the LLM omits it."""
+        """Extract date and time cues from the original utterance, independent of LLM output."""
         text = (user_text or "").casefold()
+        date_phrase = ""
         relative = re.search(r"послезавтра|завтра|сегодня", text)
         if relative:
-            phrase = relative.group(0)
-            # Keep a nearby explicit time, if present.
-            tail = text[relative.start():]
-            time_match = re.search(r"\bв\s*\d{1,2}(?::\d{2})?(?:\s+(?:утра|дня|вечера|ночи))?", tail)
-            if time_match:
-                phrase += " " + time_match.group(0)
-            return phrase
-        for word in WEEKDAYS:
-            match = re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text)
-            if match:
-                tail = text[match.start():]
-                time_match = re.search(r"\bв\s*\d{1,2}(?::\d{2})?(?:\s+(?:утра|дня|вечера|ночи))?", tail)
-                return match.group(0) + (" " + time_match.group(0) if time_match else "")
-        explicit = re.search(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?(?!\d)", text)
-        if explicit:
-            phrase = explicit.group(0)
-            tail = text[explicit.end():]
-            time_match = re.search(r"\bв\s*\d{1,2}(?::\d{2})?", tail)
-            return phrase + (" " + time_match.group(0) if time_match else "")
+            date_phrase = relative.group(0)
+        else:
+            for word in sorted(WEEKDAYS, key=len, reverse=True):
+                match = re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text)
+                if match:
+                    date_phrase = match.group(0)
+                    break
+            if not date_phrase:
+                explicit = re.search(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?(?!\d)", text)
+                if explicit:
+                    date_phrase = explicit.group(0)
+        if not date_phrase:
+            return ""
+
+        # Find time anywhere in the request, not just after the date: users often say
+        # "на 15 часов, на сегодня". Normalize it to a form the date parser understands.
+        numeric = re.search(r"(?:\bв\s*|\bна\s*)(\d{1,2})(?::(\d{2}))?\s*(?:час(?:а|ов)?\b)?(?:\s+(утра|дня|вечера|ночи))?", text)
+        if numeric:
+            h = int(numeric.group(1)); m = int(numeric.group(2) or 0); suffix = numeric.group(3)
+            if suffix in {"дня", "вечера"} and 1 <= h <= 11:
+                h += 12
+            elif suffix == "ночи" and h == 12:
+                h = 0
+            if h <= 23 and m <= 59:
+                return f"{date_phrase} в {h:02d}:{m:02d}"
+        for phrase, hour in (("в обед", 13), ("обед", 13), ("утром", 9), ("вечером", 18), ("ночью", 22)):
+            if re.search(rf"\b{re.escape(phrase)}\b", text):
+                return f"{date_phrase} в {hour:02d}:00"
+        return date_phrase
+
+
+    def _extract_title_from_request(self, user_text):
+        """Extract the task payload from common Russian create commands."""
+        text = re.sub(r"\s+", " ", (user_text or "").strip()).strip(" .!?\t")
+        text = re.sub(
+            r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|запиши|записать|поставь|поставить|напомни|напомнить)\s+",
+            "", text, flags=re.IGNORECASE,
+        )
+        text = re.sub(r"^(?:мне\s+)?(?:задачу|задача|задачку|напоминание|напоминалку|встречу)\b\s*", "", text, flags=re.IGNORECASE)
+        # Remove temporal phrases from the title, but leave the actual action.
+        text = re.sub(r"\bна\s+(?:послезавтра|завтра|сегодня)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:послезавтра|завтра|сегодня)\b", " ", text, flags=re.IGNORECASE)
+        for weekday in sorted(WEEKDAYS, key=len, reverse=True):
+            text = re.sub(rf"\b(?:на\s+)?{re.escape(weekday)}\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:на\s+)?\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?\b", " ", text)
+        text = re.sub(r"\b(?:в|на)\s*\d{1,2}(?::\d{2})?(?:\s*час(?:а|ов)?)?(?:\s+(?:утра|дня|вечера|ночи))?\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bв\s+обед\b|\bобед(?:ом)?\b|\bутром\b|\bвечером\b|\bночью\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" -—,:;.!?\t")
+        # Do not replace a potentially useful model title with a tiny/noisy fragment.
+        if len(text) >= 3:
+            return text[0].upper() + text[1:]
         return ""
 
     def _period_bounds(self, period):
@@ -156,9 +211,18 @@ class AssistantEngine:
             start, end = today, today + timedelta(days=7)
         return start.isoformat(timespec="minutes"), end.isoformat(timespec="minutes")
 
+    def _format_due(self, value):
+        if not value:
+            return "дата не указана"
+        try:
+            dt = datetime.fromisoformat(str(value))
+            return f"{dt.day} {MONTHS_RU[dt.month - 1]} {dt.year} года, {dt:%H:%M}"
+        except (TypeError, ValueError):
+            return str(value)
+
     def _format_entry(self, row):
-        due = row["due_at"] or "дата не указана"
-        return f"#{row['id']} {KIND_RU[row['kind']]}: «{row['title']}», {due}, статус: {STATUS_RU[row['status']]}"
+        due = self._format_due(row["due_at"])
+        return f"#{row['id']} {KIND_RU[row['kind']]}: «{row['title']}», срок: {due}, статус: {STATUS_RU[row['status']]}"
 
     def handle(self, user_text):
         user_text = (user_text or "").strip()
@@ -172,7 +236,7 @@ class AssistantEngine:
         # misclassify a date question as a keyword search or omit the date on create.
         normalized = re.sub(r"\s+", " ", user_text.casefold()).strip(" .!?\t")
         asks_for_period = bool(re.search(
-            r"^(?:какая|какие|что|что-нибудь|покажи|список|какие есть|есть ли).{0,70}\b(сегодня|завтра|послезавтра|на неделю|на следующей неделе)\b",
+            r"^(?:(?:какая|какие|что|что-нибудь|покажи|список|какие есть|есть ли).{0,70}|(?:задач\w*|встреч\w*|напоминани\w*).{0,35})\b(сегодня|завтра|послезавтра|на неделю|на следующей неделе)\b",
             normalized,
         )) or bool(re.search(r"\b(что у меня|какие у меня|мои задачи|мои встречи).{0,40}\b(сегодня|завтра|послезавтра)\b", normalized))
         if asks_for_period:
@@ -190,8 +254,22 @@ class AssistantEngine:
             kind = "any"
         title = str(parsed.get("title") or "").strip()
         date_text = str(parsed.get("date_text") or "").strip()
-        if action in {"create", "reschedule"} and not date_text:
-            date_text = self._extract_date_phrase(user_text)
+        source_date = self._extract_date_phrase(user_text)
+        if action == "create":
+            # The original utterance is the source of truth for relative dates;
+            # small LLMs can hallucinate yesterday's date or return midnight.
+            if source_date and re.search(r"\b(?:сегодня|завтра|послезавтра)\b", source_date):
+                date_text = source_date
+            source_title = self._extract_title_from_request(user_text)
+            if source_title:
+                title = source_title
+            else:
+                # Clean common instruction/date debris from a model-produced title.
+                title = re.sub(r"^(?:добавь|добавить|создай|создать)\s+", "", title, flags=re.IGNORECASE)
+                title = re.sub(r"^(?:мне\s+)?(?:задачу|задача|задачку)\s*", "", title, flags=re.IGNORECASE)
+                title = re.sub(r"\bна\s+(?:послезавтра|завтра|сегодня)\b", " ", title, flags=re.IGNORECASE).strip(" -—,:;.!?\t")
+        elif action == "reschedule" and not date_text:
+            date_text = source_date
         due_at = self._parse_date(date_text)
 
         if action == "clarify":
