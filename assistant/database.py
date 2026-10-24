@@ -88,6 +88,15 @@ class Repository:
             cur = con.execute("UPDATE entries SET due_at=? WHERE id=?", (due_at, entry_id))
         return cur.rowcount > 0
 
+    def update_title(self, entry_id, title):
+        """Rename an entry without changing its date, kind, or status."""
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Название не может быть пустым")
+        with self._connection() as con:
+            cur = con.execute("UPDATE entries SET title=? WHERE id=?", (title, entry_id))
+        return cur.rowcount > 0
+
     def delete(self, entry_id):
         with self._connection() as con:
             cur = con.execute("DELETE FROM entries WHERE id=?", (entry_id,))

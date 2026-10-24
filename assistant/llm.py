@@ -10,12 +10,13 @@ from .config import LLM_MODEL
 
 SYSTEM_PROMPT = """Ты разбираешь запросы русского голосового помощника для задач, напоминаний и встреч.
 Верни ровно один JSON-объект, без Markdown.
-Поля: action=create|list|search|delete|reschedule|complete|clarify|unknown;
+Поля: action=create|list|search|delete|reschedule|rename|complete|clarify|unknown;
 kind=task|reminder|meeting|any; title=название или поисковая фраза;
 date_text=дословное выражение даты/времени из запроса либо пустая строка;
-period=today|tomorrow|week|next_week|all или пустая строка; target_id=целое число или null; clarification=вопрос или пустая строка.
+period=today|tomorrow|day_after_tomorrow|week|next_week|specific_date|all или пустая строка; target_id=целое число или null; clarification=вопрос или пустая строка.
 Правила: не выдумывай дату, название или ID. «что у меня сегодня/планы на завтра/покажи встречи» — list. Для «послезавтра» используй day_after_tomorrow; для конкретного дня недели или даты — specific_date.
 «найди/когда была задача» — search. «удали» — delete; «перенеси/измени дату» — reschedule;
+«переименуй/измени название» — rename. Активные дела/задачи — list со статусом open; не включай выполненные записи.
 «выполнено/готово» — complete. Создание — create. Не подставляй дату или время по умолчанию. Если при создании задачи, напоминания или встречи не хватает даты или точного времени — action=clarify и задай конкретный вопрос. Время суток вроде «утром», «в обед», «вечером» не является точным временем — спроси часы и минуты.
 Если непонятно — unknown. Не выполняй действия, только классифицируй запрос.
 """
@@ -73,7 +74,7 @@ class LocalLLM:
             data = json.loads(match.group(0))
             result = dict(DEFAULT_RESULT)
             result.update({k: data[k] for k in result.keys() if k in data})
-            if result["action"] not in {"create", "list", "search", "delete", "reschedule", "complete", "clarify", "unknown"}:
+            if result["action"] not in {"create", "list", "search", "delete", "reschedule", "rename", "complete", "clarify", "unknown"}:
                 result["action"] = "unknown"
             if result["kind"] not in {"task", "reminder", "meeting", "any"}:
                 result["kind"] = "any"

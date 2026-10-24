@@ -309,6 +309,35 @@ class AssistantEngine:
             self.pending_clarification = None
             return "Хорошо, создание записи отменено."
 
+        if pending.get("type") == "rename_title":
+            new_title = user_text.strip().strip('«»\"\' ').strip(" .!?")
+            if not new_title:
+                return "Введите новое название записи."
+            if len(new_title) > 200:
+                return "Название слишком длинное. Укажите не более 200 символов."
+            updated = self.repo.update_title(pending["entry_id"], new_title)
+            row = self.repo.get(pending["entry_id"]) if updated else None
+            self.pending_clarification = None
+            if not row:
+                return "Не удалось изменить название: запись не найдена."
+            return "Название изменено: " + self._format_entry(row)
+
+        if pending.get("type") == "edit_field":
+            if re.search(r"\b(?:названи\w*|имя|переименован\w*)\b", normalized):
+                self.pending_clarification = {
+                    "type": "rename_title", "entry_id": pending["entry_id"],
+                    "title": pending["title"], "kind": pending["kind"],
+                }
+                return f"Какое новое название задать записи «{pending['title']}»?"
+            if re.search(r"\b(?:дат\w*|врем\w*|срок\w*|перенос\w*)\b", normalized):
+                self.pending_clarification = {
+                    "type": "reschedule_date", "entry_id": pending["entry_id"],
+                    "title": pending["title"], "kind": pending["kind"],
+                    "date_text": "", "time_value": None,
+                }
+                return f"Укажите новую дату и точное время для «{pending['title']}», например: завтра в 15:30."
+            return "Что изменить: название или срок (дату и время)?"
+
         if pending.get("type") == "create_kind":
             answer = user_text.casefold()
             if re.search(r"\b(?:задач\w*|дело)\b", answer):
@@ -424,6 +453,68 @@ class AssistantEngine:
         due = self._format_due(row["due_at"])
         return f"#{row['id']} {KIND_RU[row['kind']]}: «{row['title']}», срок: {due}, статус: {STATUS_RU[row['status']]}"
 
+    def _resolve_mutation_target(self, user_text, parsed_title="", kind="any"):
+        """Resolve a mutation target conservatively; never mutate a fuzzy guess silently.
+
+        Returns (row, candidates, explicit_id). ``explicit_id`` is set even if the ID
+        does not exist, which prevents fallback to a different row.
+        """
+        id_match = re.search(r"(?:#\s*|\b(?:id|номер|запись)\s*#?\s*)(\d+)\b", user_text, re.IGNORECASE)
+        if id_match:
+            explicit_id = int(id_match.group(1))
+            return self.repo.get(explicit_id), [], explicit_id
+
+        candidates = [r for r in self.repo.all(1000) if kind in {"any", r["kind"]}]
+        normalized = (user_text or "").casefold()
+        direct = [r for r in candidates if len(r["title"].strip()) >= 3 and r["title"].casefold() in normalized]
+        if direct:
+            longest = max(len(r["title"]) for r in direct)
+            direct = [r for r in direct if len(r["title"]) == longest]
+            if len(direct) == 1:
+                return direct[0], [], None
+            return None, direct, None
+
+        query = (parsed_title or "").strip()
+        if query:
+            exact = [r for r in candidates if r["title"].casefold().strip() == query.casefold()]
+            if len(exact) == 1:
+                return exact[0], [], None
+            if len(exact) > 1:
+                return None, exact, None
+
+        matches = self.repo.find(query or user_text, kind, limit=10)
+        # A single lexical match may still be a weak partial match. Only trust it when
+        # the supplied title has meaningful overlap; multiple matches must be clarified.
+        if len(matches) == 1 and query:
+            return matches[0], [], None
+        return None, matches, None
+
+    def _extract_new_title(self, user_text, row):
+        quoted = re.findall(r"[«“\"]([^»”\"]+)[»”\"]", user_text or "")
+        if len(quoted) >= 2:
+            return quoted[-1].strip()
+        id_match = re.search(r"(?:#\s*|\b(?:id|номер|запись)\s*#?\s*)(\d+)\b", user_text or "", re.IGNORECASE)
+        if len(quoted) == 1 and id_match:
+            return quoted[0].strip()
+        source = user_text or ""
+        index = source.casefold().find(row["title"].casefold())
+        if index >= 0:
+            tail = source[index + len(row["title"]):].lstrip('»”"\' \t')
+            tail = re.sub(r"^\s*(?:на|вместо|как|в|будет)\s+", "", tail, flags=re.IGNORECASE)
+            tail = re.sub(r"^\s*(?:новое\s+)?названи\w*\s*[:=]?\s*", "", tail, flags=re.IGNORECASE)
+            tail = tail.strip().strip('«»“”\"\' ').strip(" .!?,;:")
+            # A transition word is required: don't treat trailing politeness words as a title.
+            if tail and not re.fullmatch(r"(?:пожалуйста|название|имя|задачу|задача)", tail, re.IGNORECASE):
+                return tail
+        if id_match:
+            tail = source[id_match.end():]
+            tail = re.sub(r"^\s*(?:задач\w*|дело|дела|запись|напоминани\w*|встреч\w*)\s*", "", tail, flags=re.IGNORECASE)
+            tail = re.sub(r"^\s*(?:на|вместо|как|в|будет)\s+", "", tail, flags=re.IGNORECASE)
+            tail = tail.strip().strip('«»“”\"\' ').strip(" .!?,;:")
+            if tail:
+                return tail
+        return ""
+
     def handle(self, user_text):
         user_text = (user_text or "").strip()
         if not user_text:
@@ -437,12 +528,13 @@ class AssistantEngine:
         # Deterministic safeguards: natural-language facts from the user are authoritative;
         # a small LLM may classify an action, but cannot invent a deadline/time.
         normalized = re.sub(r"\s+", " ", user_text.casefold()).strip(" .!?\t")
+        normalized = normalized.replace("ё", "е")
         period_match = re.search(
             r"\b(послезавтра|завтра|сегодня|на\s+следующей\s+неделе|на\s+этой\s+неделе|на\s+эту\s+неделю|эту\s+неделю|этой\s+неделе|на\s+неделю)\b",
             normalized,
         )
         list_lead = bool(re.search(
-            r"^(?:какая?\s+задач\w*|какие\s+задач\w*|задач\w*|встреч\w*|событи\w*|напоминани\w*|что\b|что\s+запланировано|(?:какие\s+)?планы\b|покажи|список|есть\s+ли|мои\s+(?:задач\w*|встреч\w*|событи\w*|напоминани\w*))",
+            r"^(?:вывод\w*|выведи|вывести|покажи|показать|список|какая?\s+задач\w*|какие\s+задач\w*|задач\w*|встреч\w*|событи\w*|напоминани\w*|что\b|что\s+запланировано|(?:какие\s+)?планы\b|есть\s+ли|мои\s+(?:задач\w*|встреч\w*|событи\w*|напоминани\w*)|активн\w*|незаверш[еёе]н\w*|открыт\w*)",
             normalized,
         ))
         asks_for_period = bool(period_match and list_lead)
@@ -450,6 +542,7 @@ class AssistantEngine:
             r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|запиши|записать|поставь|поставить|напомни|напомнить|назначь|назначить|запланируй|запланировать)\b",
             normalized,
         ))
+        active_query = bool(re.search(r"\b(?:активн\w*|незаверш[еёе]н\w*|открыт\w*)\b", normalized)) and not is_create_utterance
         natural_task_create = bool(
             re.search(r"\b(?:нужно|надо|необходимо|пора)\b", normalized)
             and (self._extract_date_phrase(user_text) or re.search(r"\b(?:задач\w*|отч[её]т|позвонить|отправить|купить|сделать)\b", normalized))
@@ -458,7 +551,42 @@ class AssistantEngine:
             r"\b(?:у\s+меня|у\s+нас)\s+(?:будет\s+)?встреч\w*\b",
             normalized,
         )) and not normalized.endswith("?")
-        if asks_for_period and not is_create_utterance:
+
+        # Resolve common list/edit phrases deterministically before trusting an LLM label.
+        # In particular, requests for active work must not become a fuzzy keyword search.
+        if active_query:
+            parsed["action"] = "list"
+            if re.search(r"\b(?:встреч\w*)\b", normalized):
+                parsed["kind"] = "meeting"
+            elif re.search(r"\b(?:напоминани\w*|напоминалк\w*)\b", normalized):
+                parsed["kind"] = "reminder"
+            elif re.search(r"\bзадач\w*\b", normalized):
+                parsed["kind"] = "task"
+            else:
+                parsed["kind"] = "any"
+            if period_match:
+                phrase = period_match.group(1)
+                if "послезавтра" in phrase:
+                    parsed["period"] = "day_after_tomorrow"
+                elif "завтра" in phrase:
+                    parsed["period"] = "tomorrow"
+                elif "сегодня" in phrase:
+                    parsed["period"] = "today"
+                elif "следующей неделе" in phrase:
+                    parsed["period"] = "next_week"
+                else:
+                    parsed["period"] = "week"
+            else:
+                active_date = self._extract_date_phrase(user_text)
+                written_months = "|".join(re.escape(m) for m in MONTHS_RU_PARSE)
+                active_date_pattern = r"\b(?:" + "|".join(re.escape(w) for w in WEEKDAYS) + r"|\d{1,2}[.\-/]\d{1,2}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+(?:" + written_months + r"))\b"
+                if active_date and re.search(active_date_pattern, normalized):
+                    parsed["period"] = "specific_date"
+                    parsed["date_text"] = active_date
+                else:
+                    parsed["period"] = "all"
+            parsed["title"] = ""
+        elif asks_for_period and not is_create_utterance:
             parsed["action"] = "list"
             period = period_match.group(1)
             if "послезавтра" in period:
@@ -484,6 +612,27 @@ class AssistantEngine:
                 parsed["period"] = "specific_date"
                 parsed["date_text"] = date_for_list
                 parsed["title"] = ""
+
+        explicit_rename = bool(re.search(
+            r"\b(?:переименуй|переименовать|измени\s+(?:название|имя)|изменить\s+(?:название|имя)|поменяй\s+(?:название|имя)|поменять\s+(?:название|имя)|замени\s+(?:название|имя))\b",
+            normalized,
+        ))
+        generic_change = bool(re.match(
+            r"^(?:пожалуйста\s+)?(?:измени|изменить|поменяй|поменять|отредактируй|редактируй|обнови|обновить)\s+",
+            normalized,
+        ))
+        has_explicit_schedule = bool(self._extract_date_phrase(user_text) or self._extract_explicit_time(user_text) is not None)
+        explicit_reschedule = bool(re.search(
+            r"\b(?:перенеси|перенести|перенос|сдвинь|сдвинуть|измени\s+(?:дату|время|срок)|изменить\s+(?:дату|время|срок)|поменяй\s+(?:дату|время|срок)|поменять\s+(?:дату|время|срок)|отложи|отложить)\b",
+            normalized,
+        ))
+        if not is_create_utterance and not natural_task_create and not natural_meeting_create:
+            if explicit_rename or (generic_change and not has_explicit_schedule and re.search(r"\b(?:на|вместо)\b", normalized)):
+                parsed["action"] = "rename"
+            elif explicit_reschedule or (generic_change and has_explicit_schedule):
+                parsed["action"] = "reschedule"
+            elif generic_change:
+                parsed["action"] = "edit_unclear"
 
         action = parsed.get("action", "unknown")
         kind = parsed.get("kind", "any")
@@ -521,7 +670,7 @@ class AssistantEngine:
             ))
             if all_requested and not period_match and parsed.get("period") != "specific_date":
                 parsed["period"] = "all"
-            elif parsed.get("period") != "specific_date" and not period_match:
+            elif parsed.get("period") != "specific_date" and not period_match and not active_query:
                 # A model may fill `week` by default; that is not user consent to a period.
                 parsed["period"] = ""
 
@@ -560,27 +709,44 @@ class AssistantEngine:
             due_at = base.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
             row = self.repo.create(kind, title, due_at)
             return "Создано: " + self._format_entry(row)
+        if action == "edit_unclear":
+            row, candidates, explicit_id = self._resolve_mutation_target(user_text, title, kind)
+            if explicit_id is not None and row is None:
+                return f"Не нашёл запись с ID {explicit_id}. Ничего не изменено."
+            if row is None and len(candidates) > 1:
+                choices = "; ".join(f"{r['title']} (ID {r['id']}, {self._format_due(r['due_at'])})" for r in candidates[:5])
+                return f"Нашёл несколько похожих записей: {choices}. Уточните название или ID."
+            if row is None:
+                return "Не нашёл запись для изменения. Укажите её точное название или ID."
+            self.pending_clarification = {
+                "type": "edit_field", "entry_id": row["id"],
+                "title": row["title"], "kind": row["kind"],
+            }
+            return f"Что изменить у записи «{row['title']}»: название или срок (дату и время)?"
         if action == "list":
             period = parsed.get("period")
             if not period:
                 return "За какой период показать записи: сегодня, завтра, на неделю или все записи?"
             if period == "all":
-                rows = self.repo.all(100)
+                rows = self.repo.all(100, include_done=not active_query)
+                if kind != "any":
+                    rows = [r for r in rows if r["kind"] == kind]
             elif period == "specific_date":
                 date_value = self._parse_date(parsed.get("date_text", ""))
                 if not date_value:
                     return "Какую дату проверить? Укажите её словами или в формате ДД.ММ.ГГГГ."
                 date_obj = datetime.fromisoformat(date_value).date()
                 start_dt = datetime.combine(date_obj, datetime.min.time())
-                rows = self.repo.between(start_dt.isoformat(timespec="minutes"), (start_dt + timedelta(days=1)).isoformat(timespec="minutes"), kind)
+                rows = self.repo.between(start_dt.isoformat(timespec="minutes"), (start_dt + timedelta(days=1)).isoformat(timespec="minutes"), kind, include_done=not active_query)
             else:
                 if period not in {"today", "tomorrow", "day_after_tomorrow", "week", "next_week"}:
                     return "За какой период показать записи: сегодня, завтра, на неделю или все записи?"
                 start, end = self._period_bounds(period)
-                rows = self.repo.between(start, end, kind)
+                rows = self.repo.between(start, end, kind, include_done=not active_query)
             if not rows:
-                return "За указанный период записей не найдено."
-            return "Найдено:\n" + "\n".join(self._format_entry(r) for r in rows[:20])
+                return "Активных записей не найдено." if active_query else "За указанный период записей не найдено."
+            prefix = "Активные записи:\n" if active_query else "Найдено:\n"
+            return prefix + "\n".join(self._format_entry(r) for r in rows[:20])
         if action == "search":
             query = title or user_text
             rows = self.repo.find(query, kind)
@@ -606,26 +772,29 @@ class AssistantEngine:
             if not rows:
                 return f"Не нашёл запись по запросу «{query}»."
             return "Нашёл:\n" + "\n".join(self._format_entry(r) for r in rows[:10])
-        if action in {"delete", "reschedule", "complete"}:
-            # Never trust a model-inferred ID for a destructive/mutating action unless
-            # the user explicitly mentioned that ID in their own words.
-            id_match = re.search(r"(?:#\s*|\b(?:id|номер|запись)\s*#?\s*)(\d+)\b", user_text, re.IGNORECASE)
-            target_id = int(id_match.group(1)) if id_match else None
-            row = self.repo.get(target_id) if target_id is not None else None
-            if target_id is not None and row is None:
-                return f"Не нашёл запись с ID {target_id}. Ничего не изменено."
+        if action in {"delete", "reschedule", "complete", "rename"}:
+            row, matches, explicit_id = self._resolve_mutation_target(user_text, title, kind)
+            if explicit_id is not None and row is None:
+                return f"Не нашёл запись с ID {explicit_id}. Ничего не изменено."
+            if row is None and len(matches) > 1:
+                choices = "; ".join(f"{r['title']} (ID {r['id']}, {self._format_due(r['due_at'])})" for r in matches[:5])
+                return f"Нашёл несколько похожих записей: {choices}. Уточните название, дату или ID."
             if row is None:
-                matches = self.repo.find(title or user_text, kind)
-                exact = [r for r in matches if title and r["title"].casefold().strip() == title.casefold().strip()]
-                if len(exact) == 1:
-                    row = exact[0]
-                elif len(matches) > 1:
-                    choices = "; ".join(f"{r['title']} ({self._format_due(r['due_at'])})" for r in matches[:5])
-                    return f"Нашёл несколько похожих записей: {choices}. Уточните название, дату или ID."
-                else:
-                    row = matches[0] if matches else None
-            if row is None:
-                return "Не нашёл запись. Назовите её точнее."
+                return "Не нашёл запись. Назовите её точнее или укажите ID."
+            if action == "rename":
+                new_title = self._extract_new_title(user_text, row)
+                if not new_title:
+                    self.pending_clarification = {
+                        "type": "rename_title", "entry_id": row["id"],
+                        "title": row["title"], "kind": row["kind"],
+                    }
+                    return f"На какое новое название изменить запись «{row['title']}»?"
+                if len(new_title) > 200:
+                    return "Новое название слишком длинное. Укажите не более 200 символов."
+                updated = self.repo.update_title(row["id"], new_title)
+                if not updated:
+                    return "Не удалось изменить название: запись не найдена."
+                return "Название изменено: " + self._format_entry(self.repo.get(row["id"]))
             if action == "delete":
                 self.repo.delete(row["id"])
                 return f"Удалено: {KIND_RU[row['kind']]} «{row['title']}» (ID {row['id']})."

@@ -426,5 +426,81 @@ class CoreTests(unittest.TestCase):
         self.assertIn("отменено", result.casefold())
         self.assertEqual(self.repo.all(), [])
 
+    def test_active_work_list_is_forced_to_list_even_if_llm_says_search(self):
+        active = self.repo.create("task", "Подготовить отчёт", "2026-10-21T10:00")
+        done = self.repo.create("task", "Сдать старый отчёт", "2026-10-20T09:00")
+        self.repo.complete(done["id"])
+        engine = self.engine([{"action": "search", "kind": "task", "title": "активные дела", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Выведи активные дела")
+        self.assertIn("Активные записи", result)
+        self.assertIn("Подготовить отчёт", result)
+        self.assertNotIn("Сдать старый отчёт", result)
+
+    def test_active_list_can_filter_to_a_specific_period(self):
+        self.repo.create("task", "Активная задача завтра", "2026-10-21T10:00")
+        self.repo.create("task", "Активная задача через день", "2026-10-22T10:00")
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи активные задачи на завтра")
+        self.assertIn("Активная задача завтра", result)
+        self.assertNotIn("Активная задача через день", result)
+
+    def test_rename_entry_by_quoted_old_and_new_titles(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Сходить в парк", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Переименуй задачу «Сходить в парк» в «Погулять в парке»")
+        updated = self.repo.get(row["id"])
+        self.assertIn("Название изменено", result)
+        self.assertEqual(updated["title"], "Погулять в парке")
+        self.assertEqual(updated["due_at"], "2026-10-21T15:30")
+
+    def test_rename_entry_with_unquoted_new_title(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Сходить в парк", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Измени название задачи «Сходить в парк» на Погулять в парке")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Погулять в парке")
+
+    def test_rename_entry_by_id(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle(f"Переименуй задачу #{row['id']} в «Погулять в парке»")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Погулять в парке")
+
+    def test_change_time_phrase_routes_to_reschedule(self):
+        row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T10:00")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Измени время задачи «Позвонить Ивану» на завтра в 16:30")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+    def test_rename_entry_without_new_title_asks_and_waits(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Сходить в парк", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Переименуй задачу «Сходить в парк»")
+        self.assertIn("На какое новое название", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Сходить в парк")
+        result = engine.handle("Прогуляться в парке")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Прогуляться в парке")
+
+    def test_unambiguous_reschedule_works_even_when_llm_misclassifies_search(self):
+        row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T10:00")
+        engine = self.engine([{"action": "search", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Перенеси задачу «Позвонить Ивану» на завтра в 16:30")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+    def test_generic_edit_asks_what_to_change_instead_of_failing(self):
+        row = self.repo.create("task", "Купить молоко", "2026-10-21T10:00")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Купить молоко", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Измени задачу «Купить молоко»")
+        self.assertIn("Что изменить", result)
+        result = engine.handle("название")
+        self.assertIn("Какое новое название", result)
+        result = engine.handle("Купить хлеб")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Купить хлеб")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
