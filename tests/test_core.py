@@ -40,10 +40,10 @@ class CoreTests(unittest.TestCase):
 
     def test_create_request_parses_tomorrow(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "Сдать доклад", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
-        result = engine.handle("Добавь задачу на завтра: сдать доклад")
+        result = engine.handle("Добавь задачу на завтра в 10:00: сдать доклад")
         self.assertIn("Создано", result)
         row = self.repo.all()[0]
-        self.assertEqual(row["due_at"], "2026-10-21T09:00")
+        self.assertEqual(row["due_at"], "2026-10-21T10:00")
 
     def test_list_and_search(self):
         self.repo.create("task", "Подготовить презентацию", "2026-10-21T10:00")
@@ -70,25 +70,25 @@ class CoreTests(unittest.TestCase):
     def test_iso_datetime_returned_by_llm_is_accepted(self):
         engine = self.engine([])
         self.assertEqual(engine._parse_date("2026-10-21T13:57"), "2026-10-21T13:57")
-        self.assertEqual(engine._parse_date("2026-10-21"), "2026-10-21T09:00")
+        self.assertEqual(engine._parse_date("2026-10-21"), "2026-10-21T00:00")
 
     def test_create_accepts_iso_datetime_from_llm(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "Проверить расписание", "date_text": "2026-10-21T13:57", "period": "week", "target_id": None, "clarification": ""}])
-        result = engine.handle("Добавь задачу на завтра: проверить расписание")
+        result = engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
         self.assertIn("Создано", result)
-        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T09:00")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T10:00")
 
     def test_create_relative_date_overrides_stale_llm_date(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "задача на завтра - сходить в парк", "date_text": "2026-10-19T00:00", "period": "week", "target_id": None, "clarification": ""}])
-        result = engine.handle("Создать задачу на завтра сходить в парк")
+        result = engine.handle("Создать задачу на завтра в 10:00 сходить в парк")
         row = self.repo.all()[0]
         self.assertIn("Создано", result)
         self.assertEqual(row["title"], "Сходить в парк")
-        self.assertEqual(row["due_at"], "2026-10-21T09:00")
+        self.assertEqual(row["due_at"], "2026-10-21T10:00")
 
     def test_create_title_removes_command_and_date_phrase(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "задачу на завтра проверить расписание", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
-        engine.handle("Добавь задачу на завтра: проверить расписание")
+        engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
         self.assertEqual(self.repo.all()[0]["title"], "Проверить расписание")
 
     def test_bare_tasks_for_tomorrow_is_list(self):
@@ -99,10 +99,10 @@ class CoreTests(unittest.TestCase):
 
     def test_create_uses_date_from_original_text_when_llm_omits_it(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "Проверить расписание", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
-        result = engine.handle("Добавь задачу на завтра: проверить расписание")
+        result = engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
         self.assertIn("Создано", result)
         row = self.repo.all()[0]
-        self.assertEqual(row["due_at"], "2026-10-21T09:00")
+        self.assertEqual(row["due_at"], "2026-10-21T10:00")
 
     def test_tomorrow_question_is_list_even_if_llm_says_search(self):
         self.repo.create("task", "Проверить расписание", "2026-10-21T09:00")
@@ -116,7 +116,7 @@ class CoreTests(unittest.TestCase):
             {"action": "create", "kind": "task", "title": "Проверить расписание", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""},
             {"action": "search", "kind": "any", "title": "расписание", "date_text": "", "period": "all", "target_id": None, "clarification": ""},
         ])
-        first = engine.handle("Добавь задачу на завтра: проверить расписание")
+        first = engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
         second = engine.handle("Найди задачу про расписание")
         self.assertIn("Создано", first)
         self.assertIn("проверить расписание", second.casefold())
@@ -139,13 +139,14 @@ class CoreTests(unittest.TestCase):
         self.assertIn("Сходить в парк", spoken)
 
 
-    def test_create_lunch_phrase_uses_13_and_removes_daypart_from_title(self):
-        engine = self.engine([{"action": "create", "kind": "task", "title": "В обед, садить, погулять на речку", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
-        result = engine.handle("Добавь задачу сегодня в обед, садить, погулять на речку")
-        row = self.repo.all()[0]
+    def test_vague_daypart_asks_for_exact_time(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Погулять на речке", "date_text": "сегодня", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу сегодня в обед: погулять на речке")
+        self.assertIn("точное время", result)
+        self.assertEqual(self.repo.all(), [])
+        result = engine.handle("13:00")
         self.assertIn("Создано", result)
-        self.assertEqual(row["title"], "Садить, погулять на речку")
-        self.assertEqual(row["due_at"], "2026-10-20T13:00")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-20T13:00")
 
     def test_create_on_15_hours_today_keeps_time_and_cleans_title(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "На 15 часов, сходите на работу", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
@@ -157,8 +158,8 @@ class CoreTests(unittest.TestCase):
 
     def test_parse_dayparts(self):
         engine = self.engine([])
-        self.assertEqual(engine._parse_date("сегодня в обед"), "2026-10-20T13:00")
-        self.assertEqual(engine._parse_date("завтра вечером"), "2026-10-21T18:00")
+        self.assertEqual(engine._parse_date("сегодня в обед"), "2026-10-20T00:00")
+        self.assertEqual(engine._parse_date("завтра вечером"), "2026-10-21T00:00")
         self.assertEqual(engine._parse_date("сегодня в 15:00"), "2026-10-20T15:00")
 
     def test_empty_title_rejected(self):
@@ -168,19 +169,19 @@ class CoreTests(unittest.TestCase):
     def test_llm_clarify_classification_still_starts_meeting_dialog(self):
         engine = self.engine([{"action": "clarify", "kind": "meeting", "title": "Встреча с Иваном", "date_text": "завтра", "period": "week", "target_id": None, "clarification": "Уточните время"}])
         first = engine.handle("Добавь встречу с Иваном завтра")
-        self.assertIn("На какое время", first)
+        self.assertIn("точное время", first)
         self.assertEqual(self.repo.all(), [])
         second = engine.handle("в 15:00")
-        self.assertIn("Встреча создана", second)
+        self.assertIn("Создано", second)
         self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
 
     def test_meeting_missing_time_starts_active_clarification(self):
         engine = self.engine([{"action": "create", "kind": "meeting", "title": "Встреча с Иваном", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
         first = engine.handle("Добавь встречу с Иваном завтра")
-        self.assertIn("На какое время", first)
+        self.assertIn("точное время", first)
         self.assertEqual(self.repo.all(), [])
         second = engine.handle("в 15:00")
-        self.assertIn("Встреча создана", second)
+        self.assertIn("Создано", second)
         row = self.repo.all()[0]
         self.assertEqual(row["title"], "Встреча с Иваном")
         self.assertEqual(row["due_at"], "2026-10-21T15:00")
@@ -188,9 +189,9 @@ class CoreTests(unittest.TestCase):
     def test_meeting_clarification_can_supply_date_and_time(self):
         engine = self.engine([{"action": "create", "kind": "meeting", "title": "Дизайнер", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
         first = engine.handle("Добавь встречу с дизайнером")
-        self.assertIn("На какую дату и время", first)
+        self.assertIn("На какую дату", first)
         second = engine.handle("в пятницу в 11:30")
-        self.assertIn("Встреча создана", second)
+        self.assertIn("Создано", second)
         self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-23T11:30")
 
     def test_semantic_search_cosine_ranking_with_injected_encoder(self):
@@ -235,6 +236,55 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(self.repo.all(100)), 12)
 
+
+    def test_task_without_time_asks_and_does_not_create_until_answer(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу на завтра сходить в парк")
+        self.assertIn("точное время", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("в 15:30")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["title"], "Сходить в парк")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:30")
+
+    def test_task_without_date_asks_for_date_and_then_time(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить хлеб", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу купить хлеб в 16:00")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("завтра")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:00")
+
+    def test_vague_daypart_is_not_silently_converted_to_time(self):
+        engine = self.engine([])
+        self.assertEqual(engine._extract_explicit_time("завтра вечером"), None)
+        self.assertEqual(engine._extract_date_phrase("завтра вечером"), "завтра")
+
+    def test_list_without_period_asks_instead_of_defaulting_to_week(self):
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи мои записи")
+        self.assertIn("За какой период", result)
+
+
+    def test_task_without_date_or_time_collects_both_before_saving(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу позвонить Ивану")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("послезавтра")
+        self.assertIn("точное время", second)
+        self.assertEqual(self.repo.all(), [])
+        third = engine.handle("в 14:20")
+        self.assertIn("Создано", third)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-22T14:20")
+
+    def test_clarification_can_be_cancelled_without_creating(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в магазин", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в магазин")
+        result = engine.handle("отмена")
+        self.assertIn("отменено", result.casefold())
+        self.assertEqual(self.repo.all(), [])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

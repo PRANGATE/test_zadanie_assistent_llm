@@ -11,16 +11,16 @@ SYSTEM_PROMPT = """Ты разбираешь запросы русского г�
 Поля: action=create|list|search|delete|reschedule|complete|clarify|unknown;
 kind=task|reminder|meeting|any; title=название или поисковая фраза;
 date_text=дословное выражение даты/времени из запроса либо пустая строка;
-period=today|tomorrow|week|next_week|all; target_id=целое число или null; clarification=вопрос или пустая строка.
+period=today|tomorrow|week|next_week|all или пустая строка; target_id=целое число или null; clarification=вопрос или пустая строка.
 Правила: не выдумывай дату, название или ID. «что у меня сегодня/планы на завтра/покажи встречи» — list.
 «найди/когда была задача» — search. «удали» — delete; «перенеси/измени дату» — reschedule;
-«выполнено/готово» — complete. Создание — create. Если для встречи не хватает времени — clarify.
+«выполнено/готово» — complete. Создание — create. Не подставляй дату или время по умолчанию. Если при создании задачи, напоминания или встречи не хватает даты или точного времени — action=clarify и задай конкретный вопрос. Время суток вроде «утром», «в обед», «вечером» не является точным временем — спроси часы и минуты.
 Если непонятно — unknown. Не выполняй действия, только классифицируй запрос.
 """
 
 DEFAULT_RESULT = {
     "action": "unknown", "kind": "any", "title": "", "date_text": "",
-    "period": "week", "target_id": None, "clarification": "",
+    "period": "", "target_id": None, "clarification": "",
 }
 
 

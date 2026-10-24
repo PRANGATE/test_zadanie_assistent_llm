@@ -5,6 +5,7 @@ from .database import Repository
 from .semantic_search import SemanticSearch
 
 KIND_RU = {"task": "задача", "reminder": "напоминание", "meeting": "встреча"}
+KIND_ACC_RU = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}
 STATUS_RU = {"open": "активна", "done": "выполнена"}
 MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
 def speech_friendly_text(text):
@@ -54,7 +55,9 @@ class AssistantEngine:
             try:
                 parsed_iso = datetime.fromisoformat(iso_candidate)
                 if len(iso_candidate) == 10:
-                    parsed_iso = parsed_iso.replace(hour=9, minute=0, second=0, microsecond=0)
+                    # Date-only values remain date-only in meaning; midnight is a
+                    # parsing sentinel, never a user-facing default appointment time.
+                    parsed_iso = parsed_iso.replace(hour=0, minute=0, second=0, microsecond=0)
                 else:
                     parsed_iso = parsed_iso.replace(second=0, microsecond=0)
                 # Store local wall-clock time consistently with the rest of the app.
@@ -124,21 +127,10 @@ class AssistantEngine:
             if h <= 23 and m <= 59:
                 hour, minute = h, m
 
-        # Common Russian dayparts. "В обед" means 13:00 by default.
-        if hour is None:
-            if re.search(r"\bв\s+обед\b|\bобед(?:ом)?\b", text):
-                hour, minute = 13, 0
-            elif re.search(r"\bутром\b", text):
-                hour, minute = 9, 0
-            elif re.search(r"\bвечером\b", text):
-                hour, minute = 18, 0
-            elif re.search(r"\bночью\b", text):
-                hour, minute = 22, 0
-
         if day is not None:
-            return datetime(day.year, day.month, day.day, hour if hour is not None else 9, minute or 0).isoformat(timespec="minutes")
+            return datetime(day.year, day.month, day.day, hour if hour is not None else 0, minute or 0).isoformat(timespec="minutes")
         if clock_match and any(k in text for k in ("сегодня", "завтра", "послезавтра")):
-            return now.replace(hour=hour or 9, minute=minute or 0, second=0, microsecond=0).isoformat(timespec="minutes")
+            return now.replace(hour=hour if hour is not None else 0, minute=minute or 0, second=0, microsecond=0).isoformat(timespec="minutes")
         return None
 
     def _extract_date_phrase(self, user_text):
@@ -172,9 +164,8 @@ class AssistantEngine:
                 h = 0
             if h <= 23 and m <= 59:
                 return f"{date_phrase} в {h:02d}:{m:02d}"
-        for phrase, hour in (("в обед", 13), ("обед", 13), ("утром", 9), ("вечером", 18), ("ночью", 22)):
-            if re.search(rf"\b{re.escape(phrase)}\b", text):
-                return f"{date_phrase} в {hour:02d}:00"
+        # Vague dayparts are not silently converted into a clock time. Ask the
+        # user for an exact time instead.
         return date_phrase
 
 
@@ -218,9 +209,6 @@ class AssistantEngine:
                     h = 0
                 if 0 <= h <= 23 and 0 <= minute <= 59:
                     return h, minute
-        for phrase, value in (("в обед", (13, 0)), ("обед", (13, 0)), ("утром", (9, 0)), ("вечером", (18, 0)), ("ночью", (22, 0))):
-            if re.search(rf"\b{re.escape(phrase)}\b", text):
-                return value
         return None
 
     def _finish_pending_clarification(self, user_text):
@@ -228,27 +216,38 @@ class AssistantEngine:
         if not pending:
             return None
         normalized = user_text.casefold().strip(" .!?")
-        if normalized in {"отмена", "отмени", "не надо", "нет", "забудь"}:
+        if normalized in {"отмена", "отмени", "не надо", "нет", "забудь", "отменить"}:
             self.pending_clarification = None
-            return "Хорошо, создание встречи отменено."
-        time_value = self._extract_explicit_time(user_text)
+            return "Хорошо, создание записи отменено."
+
+        kind = pending.get("kind", "task")
+        title = pending["title"]
         date_text = pending.get("date_text", "")
-        if not date_text:
-            date_text = self._extract_date_phrase(user_text)
+        time_value = pending.get("time_value")
+        supplied_date = self._extract_date_phrase(user_text)
+        supplied_time = self._extract_explicit_time(user_text)
+
+        if not date_text and supplied_date:
+            date_text = supplied_date
+        if supplied_time:
+            time_value = supplied_time
+
         parsed_date = self._parse_date(date_text) if date_text else None
-        if time_value and parsed_date:
-            base = datetime.fromisoformat(parsed_date)
-            due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
-            row = self.repo.create("meeting", pending["title"], due_at)
-            self.pending_clarification = None
-            return "Встреча создана: " + self._format_entry(row)
-        if time_value and not parsed_date:
-            self.pending_clarification = {"type": "meeting_date", "title": pending["title"]}
-            return f"Время понял — {time_value[0]:02d}:{time_value[1]:02d}. На какую дату поставить встречу «{pending['title']}»?"
-        if parsed_date and not time_value:
-            self.pending_clarification = {"type": "meeting_time", "title": pending["title"], "date_text": date_text}
-            return f"На какую дату понял: {self._format_due(parsed_date)}. На какое время поставить встречу «{pending['title']}»?"
-        return "Не расслышал дату или время. Например, ответьте «в 15:00» или «завтра в 15:00»."
+        if not parsed_date:
+            self.pending_clarification = {"type": "create_date", "kind": kind, "title": title, "date_text": date_text, "time_value": time_value}
+            self.pending_clarification = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": time_value}
+            return f"На какую дату поставить {KIND_ACC_RU[kind]} «{title}»? Укажите дату, например: завтра или 25.10.2026."
+
+        if not time_value:
+            self.pending_clarification = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text}
+            date_label = self._format_date_only(parsed_date)
+            return f"Дата: {date_label}. На какое точное время поставить {KIND_ACC_RU[kind]} «{title}»?"
+
+        base = datetime.fromisoformat(parsed_date)
+        due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+        row = self.repo.create(kind, title, due_at)
+        self.pending_clarification = None
+        return "Создано: " + self._format_entry(row)
 
     def _period_bounds(self, period):
         now = self.clock()
@@ -263,6 +262,15 @@ class AssistantEngine:
         else:  # week means rolling seven days starting today
             start, end = today, today + timedelta(days=7)
         return start.isoformat(timespec="minutes"), end.isoformat(timespec="minutes")
+
+    def _format_date_only(self, value):
+        if not value:
+            return "дата не указана"
+        try:
+            dt = datetime.fromisoformat(str(value))
+            return f"{dt.day} {MONTHS_RU[dt.month - 1]} {dt.year} года"
+        except (TypeError, ValueError):
+            return str(value)
 
     def _format_due(self, value):
         if not value:
@@ -294,7 +302,8 @@ class AssistantEngine:
             r"^(?:(?:какая|какие|что|что-нибудь|покажи|список|какие есть|есть ли).{0,70}|(?:задач\w*|встреч\w*|напоминани\w*).{0,35})\b(сегодня|завтра|послезавтра|на неделю|на следующей неделе)\b",
             normalized,
         )) or bool(re.search(r"\b(что у меня|какие у меня|мои задачи|мои встречи).{0,40}\b(сегодня|завтра|послезавтра)\b", normalized))
-        if asks_for_period:
+        is_create_utterance = bool(re.match(r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|запиши|записать|поставь|поставить|напомни|напомнить|назначь|запланируй)\b", normalized))
+        if asks_for_period and not is_create_utterance:
             parsed["action"] = "list"
             parsed["period"] = ("tomorrow" if "завтра" in normalized and "послезавтра" not in normalized
                                 else "today" if "сегодня" in normalized
@@ -352,25 +361,36 @@ class AssistantEngine:
                 return "Не удалось определить название. Что именно нужно записать?"
             if kind == "any":
                 kind = "task"
-            if kind == "meeting" and not date_text:
-                self.pending_clarification = {"type": "meeting_date", "title": title}
-                return f"На какую дату и время поставить встречу «{title}»?"
-            if kind == "meeting" and date_text and not self._extract_explicit_time(user_text):
-                self.pending_clarification = {"type": "meeting_time", "title": title, "date_text": date_text}
-                parsed_day = self._parse_date(date_text)
-                when = self._format_due(parsed_day) if parsed_day else date_text
-                return f"Записать встречу «{title}» на {when}. На какое время поставить встречу?"
-            if date_text and due_at is None:
+
+            # Never invent a date or time. Every new task/reminder/meeting must
+            # have both explicitly supplied by the user before it is persisted.
+            explicit_time = self._extract_explicit_time(user_text)
+            if not date_text and source_date:
+                date_text = source_date
+            if not date_text and due_at:
+                date_text = due_at
+            parsed_day = self._parse_date(date_text) if date_text else None
+            if date_text and not parsed_day:
                 return f"Не смог надёжно разобрать дату «{date_text}». Уточните её, пожалуйста."
+            if not parsed_day:
+                self.pending_clarification = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": explicit_time}
+                return f"На какую дату поставить {KIND_ACC_RU[kind]} «{title}»? Укажите дату, например: завтра или 25.10.2026."
+            if not explicit_time:
+                self.pending_clarification = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text}
+                return f"Дата: {self._format_date_only(parsed_day)}. На какое точное время поставить {KIND_ACC_RU[kind]} «{title}»?"
+            base = datetime.fromisoformat(parsed_day)
+            due_at = base.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
             row = self.repo.create(kind, title, due_at)
             return "Создано: " + self._format_entry(row)
         if action == "list":
-            period = parsed.get("period", "week")
+            period = parsed.get("period")
+            if not period:
+                return "За какой период показать записи: сегодня, завтра, на неделю или все записи?"
             if period == "all":
                 rows = self.repo.all(100)
             else:
                 if period not in {"today", "tomorrow", "week", "next_week"}:
-                    period = "week"
+                    return "За какой период показать записи: сегодня, завтра, на неделю или все записи?"
                 start, end = self._period_bounds(period)
                 rows = self.repo.between(start, end, kind)
             if not rows:
