@@ -382,15 +382,42 @@ class CoreTests(unittest.TestCase):
         self.assertIn("Перенесено", second)
         self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-23T14:00")
 
-    def test_reschedule_with_time_but_no_date_asks_for_date(self):
+    def test_reschedule_with_time_but_no_date_preserves_existing_date(self):
         row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T15:00")
         engine = self.engine([{"action": "reschedule", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": row["id"], "clarification": ""}])
         first = engine.handle("Перенеси задачу позвонить Ивану на 16:30")
-        self.assertIn("На какую дату", first)
-        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T15:00")
-        second = engine.handle("завтра")
-        self.assertIn("Перенесено", second)
+        self.assertIn("Перенесено", first)
         self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+    def test_tester_case_meeting_title_variant_and_wrong_kind(self):
+        row = self.repo.create("meeting", "Встретить Стаса", "2026-10-26T20:00")
+        # A similarly worded task should not win just because the LLM says kind=task.
+        self.repo.create("task", "Подготовить встречу с заказчиком", "2026-10-27T12:00")
+        # Simulate the LLM returning both a grammatical title variant and wrong kind.
+        engine = self.engine([{"action": "reschedule", "kind": "task", "title": "встречу Стаса", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("перенеси встречу Стаса на 10 часов вечера")
+        self.assertIn("Перенесено", result)
+        self.assertNotIn("На какую дату", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-26T22:00")
+
+    def test_reschedule_full_title_works_even_if_user_calls_meeting_a_task(self):
+        row = self.repo.create("meeting", "Встретить Стаса", "2026-10-26T20:00")
+        engine = self.engine([{"action": "reschedule", "kind": "task", "title": "Встретить Стаса", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("перенеси задачу Встретить Стаса на 10 часов вечера")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-26T22:00")
+
+    def test_time_answer_during_reschedule_clarification_does_not_repeat_date_question(self):
+        row = self.repo.create("meeting", "Встретить Стаса", "2026-10-26T20:00")
+        engine = self.engine([])
+        engine.pending_clarification = {
+            "type": "reschedule_date", "entry_id": row["id"], "title": row["title"],
+            "kind": "meeting", "date_text": "", "time_value": None,
+        }
+        result = engine.handle("22:00")
+        self.assertIn("Перенесено", result)
+        self.assertNotIn("На какую дату", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-26T22:00")
 
 
     def test_ambiguous_creation_type_is_asked_not_defaulted_to_task(self):

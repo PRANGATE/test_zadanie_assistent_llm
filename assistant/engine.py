@@ -364,6 +364,21 @@ class AssistantEngine:
             if supplied_time is not None:
                 time_value = supplied_time
             parsed_date = self._parse_date(date_text) if date_text else None
+            # A time-only response must not cause the assistant to ask for the date forever.
+            # Preserve the current date when the selected entry already has one.
+            existing = self.repo.get(pending["entry_id"])
+            if not parsed_date and not date_text and time_value is not None and existing and existing.get("due_at"):
+                try:
+                    existing_dt = datetime.fromisoformat(existing["due_at"])
+                    due_at = existing_dt.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+                except (TypeError, ValueError):
+                    due_at = None
+                if due_at:
+                    updated = self.repo.update_due(pending["entry_id"], due_at)
+                    self.pending_clarification = None
+                    if not updated:
+                        return "Не удалось найти запись для переноса: возможно, её удалили."
+                    return "Перенесено: " + self._format_entry(self.repo.get(pending["entry_id"]))
             if not parsed_date:
                 self.pending_clarification = {
                     "type": "reschedule_date", "entry_id": pending["entry_id"],
@@ -464,8 +479,26 @@ class AssistantEngine:
             explicit_id = int(id_match.group(1))
             return self.repo.get(explicit_id), [], explicit_id
 
-        candidates = [r for r in self.repo.all(1000) if kind in {"any", r["kind"]}]
         normalized = (user_text or "").casefold()
+        all_candidates = self.repo.all(1000)
+        # Prefer a record whose complete stored title occurs verbatim in the command,
+        # even if the LLM guessed the wrong entry kind.
+        literal_direct = [r for r in all_candidates if len(r["title"].strip()) >= 3 and r["title"].casefold() in normalized]
+        if literal_direct:
+            longest = max(len(r["title"]) for r in literal_direct)
+            literal_direct = [r for r in literal_direct if len(r["title"]) == longest]
+            if len(literal_direct) == 1:
+                return literal_direct[0], [], None
+            return None, literal_direct, None
+
+        # Explicit words like "встречу" are stronger evidence than a mistaken LLM
+        # kind label. This matters when a task and a meeting contain similar words.
+        search_kind = kind
+        if re.search(r"\b(?:встреч\w*|созвон\w*)\b", normalized):
+            search_kind = "meeting"
+        elif re.search(r"\b(?:напоминани\w*|напоминалк\w*)\b", normalized):
+            search_kind = "reminder"
+        candidates = [r for r in all_candidates if search_kind in {"any", r["kind"]}]
         direct = [r for r in candidates if len(r["title"].strip()) >= 3 and r["title"].casefold() in normalized]
         if direct:
             longest = max(len(r["title"]) for r in direct)
@@ -482,9 +515,25 @@ class AssistantEngine:
             if len(exact) > 1:
                 return None, exact, None
 
-        matches = self.repo.find(query or user_text, kind, limit=10)
-        # A single lexical match may still be a weak partial match. Only trust it when
-        # the supplied title has meaningful overlap; multiple matches must be clarified.
+        # Search both the title predicted by the LLM and the full original command.
+        # The small LLM may return a grammatical variant of the real title or assign
+        # the wrong kind. If there is no match of that kind, retry across all kinds.
+        # Ambiguous results are still returned to the caller for clarification.
+        queries = []
+        for candidate_query in (query, user_text):
+            candidate_query = (candidate_query or "").strip()
+            if candidate_query and candidate_query.casefold() not in {q.casefold() for q in queries}:
+                queries.append(candidate_query)
+        matches_by_id = {}
+        for candidate_query in queries:
+            for item in self.repo.find(candidate_query, search_kind, limit=10):
+                matches_by_id[item["id"]] = item
+        matches = list(matches_by_id.values())
+        if not matches and kind != "any":
+            for candidate_query in queries:
+                for item in self.repo.find(candidate_query, "any", limit=10):
+                    matches_by_id[item["id"]] = item
+            matches = list(matches_by_id.values())
         if len(matches) == 1 and query:
             return matches[0], [], None
         return None, matches, None
@@ -802,6 +851,17 @@ class AssistantEngine:
                 self.repo.complete(row["id"])
                 return f"Отмечено выполненным: «{row['title']}»."
             explicit_time = self._extract_explicit_time(user_text)
+            # A time-only reschedule preserves the record's existing calendar date.
+            if not date_text and explicit_time is not None and row.get("due_at"):
+                try:
+                    existing_dt = datetime.fromisoformat(row["due_at"])
+                except (TypeError, ValueError):
+                    existing_dt = None
+                if existing_dt is not None:
+                    due_at = existing_dt.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
+                    if not self.repo.update_due(row["id"], due_at):
+                        return "Не удалось изменить срок записи."
+                    return "Перенесено: " + self._format_entry(self.repo.get(row["id"]))
             if not date_text or due_at is None:
                 self.pending_clarification = {
                     "type": "reschedule_date", "entry_id": row["id"],
