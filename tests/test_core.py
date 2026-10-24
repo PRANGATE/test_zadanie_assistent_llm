@@ -7,6 +7,7 @@ from assistant.database import Repository
 from assistant.engine import AssistantEngine
 from assistant.engine import speech_friendly_text
 from assistant.semantic_search import SemanticSearch
+from assistant.compat import transformers_dtype_kwargs
 
 
 class FakeLLM:
@@ -278,6 +279,145 @@ class CoreTests(unittest.TestCase):
         third = engine.handle("в 14:20")
         self.assertIn("Создано", third)
         self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-22T14:20")
+
+
+    def test_transformers_dtype_uses_non_deprecated_argument(self):
+        self.assertEqual(transformers_dtype_kwargs("4.56.0", "fp16"), {"dtype": "fp16"})
+        self.assertEqual(transformers_dtype_kwargs("5.20.2", "fp16"), {"dtype": "fp16"})
+        self.assertEqual(transformers_dtype_kwargs("4.55.4", "fp16"), {"torch_dtype": "fp16"})
+
+    def test_day_after_tomorrow_list_is_not_tomorrow(self):
+        self.repo.create("task", "Завтрашнее дело", "2026-10-21T10:00")
+        self.repo.create("task", "Дело послезавтра", "2026-10-22T10:00")
+        engine = self.engine([{"action": "search", "kind": "any", "title": "задачи на послезавтра", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("Какие задачи на послезавтра?")
+        self.assertIn("Дело послезавтра", result)
+        self.assertNotIn("Завтрашнее дело", result)
+
+    def test_creation_does_not_accept_date_hallucinated_by_llm(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить молоко", "date_text": "2026-10-19T09:00", "period": "all", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу купить молоко")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("завтра")
+        self.assertIn("точное время", second)
+        self.assertEqual(self.repo.all(), [])
+        third = engine.handle("15:30")
+        self.assertIn("Создано", third)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:30")
+
+    def test_relative_two_hours_written_in_words(self):
+        engine = self.engine([{"action": "clarify", "kind": "task", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": "уточните"}])
+        result = engine.handle("Добавь задачу через два часа позвонить Ивану")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["title"], "Позвонить Ивану")
+        self.assertEqual(row["due_at"], "2026-10-20T15:00")
+
+    def test_relative_thirty_minutes_is_exact_deadline(self):
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу через 30 минут позвонить Ивану")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["due_at"], "2026-10-20T13:30")
+
+    def test_natural_language_meeting_example_from_spec(self):
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("В четверг в 11 у меня встреча с дизайнером")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["kind"], "meeting")
+        self.assertEqual(row["title"], "Встреча с дизайнером")
+        self.assertEqual(row["due_at"], "2026-10-22T11:00")
+
+    def test_natural_language_task_example_from_spec_asks_for_time(self):
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("В пятницу нужно отправить отчет")
+        self.assertIn("точное время", result)
+        self.assertEqual(self.repo.all(), [])
+        result = engine.handle("в 14:00")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["title"], "Отправить отчет")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-23T14:00")
+
+    def test_deadline_before_end_of_week_is_not_lost_from_title(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить билеты", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Поставь задачу купить билеты до конца недели")
+        self.assertIn("точное время", result)
+        self.assertEqual(self.repo.all(), [])
+        result = engine.handle("17:00")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["title"], "Купить билеты")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-25T17:00")
+
+
+    def test_relative_two_days_is_not_mistaken_for_14_oclock(self):
+        engine = self.engine([])
+        self.assertIsNone(engine._extract_explicit_time("через 2 дня позвонить Ивану"))
+        self.assertEqual(engine._extract_explicit_time("через 2 дня в 15:30 позвонить Ивану"), (15, 30))
+        self.assertEqual(engine._parse_date("через 2 дня в 15:30"), "2026-10-22T15:30")
+
+    def test_weekday_list_query_returns_only_requested_day(self):
+        self.repo.create("task", "Понедельничное дело", "2026-10-26T10:00")
+        self.repo.create("task", "Пятничное дело", "2026-10-23T10:00")
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Какие задачи в пятницу?")
+        self.assertIn("Пятничное дело", result)
+        self.assertNotIn("Понедельничное дело", result)
+
+
+    def test_list_does_not_accept_llm_default_week_when_user_omits_period(self):
+        self.repo.create("task", "Запланированное дело", "2026-10-21T10:00")
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи мои записи")
+        self.assertIn("За какой период", result)
+
+    def test_reschedule_without_time_asks_and_does_not_save_midnight(self):
+        row = self.repo.create("meeting", "Встреча с командой", "2026-10-21T15:00")
+        engine = self.engine([{"action": "reschedule", "kind": "meeting", "title": "Встреча с командой", "date_text": "пятницу", "period": "all", "target_id": row["id"], "clarification": ""}])
+        first = engine.handle("Перенеси встречу с командой на пятницу")
+        self.assertIn("точное время", first)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T15:00")
+        second = engine.handle("в 14:00")
+        self.assertIn("Перенесено", second)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-23T14:00")
+
+    def test_reschedule_with_time_but_no_date_asks_for_date(self):
+        row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T15:00")
+        engine = self.engine([{"action": "reschedule", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": row["id"], "clarification": ""}])
+        first = engine.handle("Перенеси задачу позвонить Ивану на 16:30")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T15:00")
+        second = engine.handle("завтра")
+        self.assertIn("Перенесено", second)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+
+    def test_ambiguous_creation_type_is_asked_not_defaulted_to_task(self):
+        engine = self.engine([{"action": "create", "kind": "any", "title": "Купить молоко", "date_text": "завтра в 15:00", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Создай купить молоко завтра в 15:00")
+        self.assertIn("задачу, напоминание или встречу", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("напоминание")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["kind"], "reminder")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
+
+    def test_invalid_explicit_id_never_falls_back_to_another_row(self):
+        self.repo.create("task", "Позвонить Ивану", "2026-10-21T15:00")
+        engine = self.engine([{"action": "delete", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": 1, "clarification": ""}])
+        result = engine.handle("Удали задачу #999")
+        self.assertIn("ID 999", result)
+        self.assertEqual(len(self.repo.all()), 1)
+
+
+    def test_all_tasks_request_keeps_explicit_tomorrow_period(self):
+        self.repo.create("task", "Дело завтра", "2026-10-21T10:00")
+        self.repo.create("task", "Дело через неделю", "2026-10-27T10:00")
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи все задачи на завтра")
+        self.assertIn("Дело завтра", result)
+        self.assertNotIn("Дело через неделю", result)
 
     def test_clarification_can_be_cancelled_without_creating(self):
         engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в магазин", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])

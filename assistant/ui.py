@@ -1,3 +1,4 @@
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -19,6 +20,9 @@ class App:
         self.voice = None
         self.engine = None
         self._state_lock = threading.Lock()
+        self._ui_queue = queue.Queue()
+        self._closed = False
+        self.root.after(50, self._drain_ui_queue)
 
         outer = ttk.Frame(root, padding=16)
         outer.pack(fill="both", expand=True)
@@ -32,6 +36,7 @@ class App:
         self.mic.pack(pady=8)
         self.mic.bind("<ButtonPress-1>", self.start_recording)
         self.mic.bind("<ButtonRelease-1>", self.stop_recording)
+        self.mic.configure(state="disabled")
 
         ttk.Label(outer, text="Или введите запрос текстом:").pack(anchor="w", pady=(16, 4))
         row = ttk.Frame(outer); row.pack(fill="x")
@@ -49,10 +54,27 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _ui(self, fn, *args, **kwargs):
+        """Queue UI updates; only the Tk main thread touches Tk widgets."""
+        if not self._closed:
+            self._ui_queue.put((fn, args, kwargs))
+
+    def _drain_ui_queue(self):
+        if self._closed:
+            return
+        while True:
+            try:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args, **kwargs)
+            except tk.TclError:
+                # The window may have been closed while a worker was finishing.
+                continue
         try:
-            self.root.after(0, lambda: fn(*args, **kwargs))
+            self.root.after(50, self._drain_ui_queue)
         except tk.TclError:
-            pass
+            self._closed = True
 
     def _init_models(self):
         try:
@@ -76,13 +98,15 @@ class App:
         with self._state_lock:
             self.busy = False
         self.send_button.configure(state="normal")
+        self.mic.configure(state="normal")
         self.status.set("Готово. Можно вводить следующий запрос.")
 
     def _set_busy(self, busy):
         with self._state_lock:
             self.busy = busy
-        self.send_button.configure(state="disabled" if busy else "normal")
-        self.mic.configure(state="disabled" if busy else "normal")
+        enabled = bool(self.engine) and not busy
+        self.send_button.configure(state="normal" if enabled else "disabled")
+        self.mic.configure(state="normal" if enabled else "disabled")
 
     def _append(self, who, text):
         self.history.configure(state="normal")
@@ -170,6 +194,7 @@ class App:
         self.mic.configure(state="normal" if self.engine else "disabled", text="ЗАЖМИТЕ И ГОВОРИТЕ", bg="#d9eaff")
 
     def close(self):
+        self._closed = True
         self.stop_event.set()
         try:
             if self.engine:

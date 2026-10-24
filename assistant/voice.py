@@ -39,7 +39,20 @@ class Voice:
     def transcribe(self, audio):
         if audio is None or len(audio) < SAMPLE_RATE // 3:
             return ""
-        segments, _ = self.whisper.transcribe(audio, language="ru", vad_filter=True, beam_size=3)
+        segments, _ = self.whisper.transcribe(
+            audio,
+            language="ru",
+            task="transcribe",
+            vad_filter=True,
+            beam_size=5,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            initial_prompt=(
+                "Русская речь о личных задачах, напоминаниях, встречах, датах и времени. "
+                "Примеры формулировок: добавить задачу, сходить в парк, позвонить Ивану, "
+                "завтра, послезавтра, в пятницу, в 15:30."
+            ),
+        )
         return " ".join(segment.text.strip() for segment in segments).strip()
 
     def speak(self, text):
