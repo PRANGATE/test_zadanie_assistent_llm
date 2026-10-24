@@ -61,6 +61,42 @@ class LocalLLM:
             generated = output[0, inputs["input_ids"].shape[1]:]
             return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
 
+    def suggest_parameter(self, field, title, now_iso, date_text=""):
+        """Ask the local model for an uncommitted candidate date or time.
+
+        The value is validated by AssistantEngine and is only applied after the
+        user explicitly accepts it. This method never reads or writes the database.
+        """
+        if field not in {"date", "time"}:
+            return None
+        if field == "time":
+            expected = "строгое время ЧЧ:ММ, например 15:00 или 18:30"
+            context = f"Дата записи: {date_text or 'не указана'}"
+        else:
+            expected = "дату в формате YYYY-MM-DD или одно из слов сегодня/завтра/послезавтра"
+            context = "Нужна календарная дата, не время суток"
+        messages = [
+            {"role": "system", "content": (
+                "Ты предлагаешь один осторожный вариант недостающего параметра для локального планировщика. "
+                "Ничего не создавай и не изменяй. Верни только JSON вида {\"value\":\"...\"}. "
+                f"Для поля {field} верни {expected}. Не добавляй пояснений, не выдумывай дату из прошлого."
+            )},
+            {"role": "user", "content": (
+                f"Сейчас: {now_iso}. Запись: {title}. {context}. "
+                f"Предложи удобный кандидат для поля {field}. Только JSON."
+            )},
+        ]
+        raw = self._generate(messages, max_new_tokens=64)
+        match = re.search(r"\{.*?\}", raw, re.S)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        value = data.get("value") if isinstance(data, dict) else None
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
     def parse(self, user_text, now_iso, records_summary=""):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},

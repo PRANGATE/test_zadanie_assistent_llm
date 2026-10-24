@@ -263,8 +263,13 @@ class AssistantEngine:
         return ""
 
     def _extract_explicit_time(self, text):
-        """Return a time explicitly said by the user, including a relative hour/minute duration."""
-        text = (text or "").casefold()
+        """Return a clearly stated clock time or relative hours/minutes.
+
+        Accepted forms include 15:30, 22 00, "10 часов вечера",
+        "в 15 часов 30 минут", and relative phrases like "через два часа".
+        Vague dayparts such as "вечером" are deliberately not exact times.
+        """
+        text = (text or "").casefold().replace("ё", "е").strip()
         duration = self._duration_match(text)
         if duration and duration[0] in {"minutes", "hours"}:
             delta = timedelta(minutes=duration[1]) if duration[0] == "minutes" else timedelta(hours=duration[1])
@@ -273,41 +278,317 @@ class AssistantEngine:
         if duration and duration[0] == "days":
             text = text.replace(duration[2], " ", 1)
 
-        # Remove date tokens so the day/month in a date cannot accidentally become a time.
+        # Remove date tokens so a date like 26.10.2026 is never treated as a time.
         cleaned = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?\b", " ", text)
         cleaned = re.sub(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?(?!\d)", " ", cleaned)
-        patterns = [
-            r"\b(?:в|на)\s*(\d{1,2}):(\d{2})\b",
-            r"\b(?:в|на)\s*(\d{1,2})(?:\s*час(?:а|ов)?\b)?(?:\s+(утра|дня|вечера|ночи))?",
-            r"\b(\d{1,2}):(\d{2})\b",
-            r"\b(\d{1,2})\s+(утра|дня|вечера|ночи)\b",
-        ]
-        for index, pattern in enumerate(patterns):
+
+        found = None
+        # Colon time, with or without a preposition.
+        for pattern in (
+            r"\b(?:в|на)\s*(\d{1,2})\s*:\s*(\d{2})\b",
+            r"\b(\d{1,2})\s*:\s*(\d{2})\b",
+        ):
             match = re.search(pattern, cleaned)
-            if not match:
-                continue
-            if index in (0, 2):
-                hour, minute = int(match.group(1)), int(match.group(2))
-                suffix = None
+            if match:
+                found = (int(match.group(1)), int(match.group(2)), None)
+                break
+
+        # Spoken numeric form: "в 22 00" / "22 00". The bare form is only
+        # accepted when the whole utterance is just a time, to avoid reading
+        # arbitrary number pairs in a command as hours/minutes.
+        if found is None:
+            spaced_time = re.fullmatch(r"\s*(?:(?:в|на)\s*)?(\d{1,2})\s+(\d{2})\s*", cleaned)
+            if spaced_time:
+                found = (int(spaced_time.group(1)), int(spaced_time.group(2)), None)
             else:
-                hour = int(match.group(1)); minute = 0
-                suffix = match.group(2) if index == 1 else match.group(2)
-            if suffix in {"дня", "вечера"} and 1 <= hour <= 11:
-                hour += 12
-            elif suffix == "ночи" and hour == 12:
-                hour = 0
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return hour, minute
+                spaced_in_sentence = re.search(r"\b(?:в|на)\s+(\d{1,2})\s+(\d{2})\b", cleaned)
+                if spaced_in_sentence:
+                    found = (int(spaced_in_sentence.group(1)), int(spaced_in_sentence.group(2)), None)
+
+        # Spoken hour forms: "10 часов вечера", "в 15 часов 30 минут",
+        # "10 вечера", and "в 22". Optional prepositions allow users to answer
+        # a clarification with only the time phrase.
+        if found is None:
+            # A bare number inside a task title is not a time. Require a time
+            # preposition, an explicit "часов" marker, or a daypart suffix.
+            hour_patterns = (
+                r"\b(?:в|на)\s*(\d{1,2})(?:\s*час(?:а|ов)?)?(?:\s+(\d{1,2})\s*минут\w*)?(?:\s+(утра|дня|вечера|ночи))?\b",
+                r"\b(\d{1,2})\s*час(?:а|ов)(?:\s+(\d{1,2})\s*минут\w*)?(?:\s+(утра|дня|вечера|ночи))?\b",
+                r"\b(\d{1,2})\s+(утра|дня|вечера|ночи)\b",
+            )
+            for index, pattern in enumerate(hour_patterns):
+                match = re.search(pattern, cleaned)
+                if not match:
+                    continue
+                hour = int(match.group(1))
+                if index in (0, 1):
+                    minute = int(match.group(2) or 0)
+                    suffix = match.group(3)
+                else:
+                    minute = 0
+                    suffix = match.group(2)
+                found = (hour, minute, suffix)
+                break
+
+        # A plain integer is accepted only when the entire response is a time,
+        # e.g. a user answers "22" to the question about the exact time.
+        if found is None:
+            bare_hour = re.fullmatch(r"\s*(?:(?:в|на)\s*)?(\d{1,2})(?:\s*час(?:а|ов)?)?\s*", cleaned)
+            if bare_hour:
+                found = (int(bare_hour.group(1)), 0, None)
+
+        if found is None:
+            return None
+        hour, minute, suffix = found
+        if suffix in {"дня", "вечера"} and 1 <= hour <= 11:
+            hour += 12
+        elif suffix in {"утра", "ночи"} and hour == 12:
+            hour = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
         return None
+
+    @staticmethod
+    def _is_yes(text):
+        normalized = re.sub(r"[.!?]+$", "", (text or "").casefold().replace("ё", "е")).strip()
+        return bool(re.fullmatch(
+            r"(?:да(?:\s*[, ]\s*(?:давай|хорошо|отлично|подходит|подойдет|принимаю|согласен|согласна))?|"
+            r"ага|конечно|подходит|подойдет|принимаю|согласен|согласна|ок|хорошо|отлично|подтверждаю)",
+            normalized,
+        ))
+
+    @staticmethod
+    def _is_no(text):
+        normalized = re.sub(r"[.!?]+$", "", (text or "").casefold().replace("ё", "е")).strip()
+        return bool(re.fullmatch(
+            r"(?:нет(?:\s*[, ]\s*(?:не подходит|другой вариант|предложи другой))?|"
+            r"не подходит|другой вариант|предложи другой)", normalized,
+        ))
+
+    @staticmethod
+    def _wants_suggestion(text):
+        return bool(re.search(r"\b(?:предложи|предложение|подскажи|порекомендуй|вариант|что посоветуешь)\b", (text or "").casefold()))
+
+    @staticmethod
+    def _looks_like_new_command(text):
+        """Recognize a fresh command while a date/time clarification is pending."""
+        normalized = (text or "").casefold().replace("ё", "е").strip()
+        return bool(re.match(
+            r"^(?:(?:ну|ладно|слушай|да)\s+)?(?:(?:иди|пожалуйста)\s+)?(?:покажи|показать|выведи|вывести|список|найди|найти|создай|создать|добавь|добавить|запланируй|запланировать|удали|удалить|перенеси|перенести|переименуй|переименовать|измени|изменить|поменяй|поменять|отметь|отметить|заверши|завершить|какие\s+задачи|активные\s+дела)\b",
+            normalized,
+        ))
+
+    def _pending_field(self, pending):
+        kind = pending.get("type", "")
+        if kind in {"create_time", "reschedule_time"}:
+            return "time"
+        if kind in {"create_date", "reschedule_date"}:
+            return "date"
+        return "other"
+
+    def _pending_prompt(self, pending, invalid_text=None):
+        """Short, field-specific clarification with explicit examples and escape routes."""
+        field = self._pending_field(pending)
+        title = pending.get("title", "записи")
+        kind = pending.get("kind", "task")
+        action_word = "перенести" if pending.get("type", "").startswith("reschedule") else "поставить"
+        if field == "time":
+            known_date = pending.get("date_text")
+            prefix = "Не распознал время" + (f' «{invalid_text.strip()}»' if invalid_text else "") + ". " if invalid_text else ""
+            return (
+                f"{prefix}Укажите точное время для «{title}»: 15:30, 22:00, «10 часов вечера» или «22 00». "
+                "Чтобы получить вариант ассистента, напишите «предложи время»; чтобы отменить операцию — «отмена». "
+                "Можно ввести ответ текстом, если распознавание речи ошибается."
+            )
+        if field == "date":
+            prefix = "Не распознал дату" + (f' «{invalid_text.strip()}»' if invalid_text else "") + ". " if invalid_text else ""
+            return (
+                f"{prefix}На какую дату {action_word} запись «{title}»? Примеры: «сегодня», «завтра», "
+                "«послезавтра», «в пятницу» или «26.10.2026». Чтобы получить вариант ассистента, напишите «предложи дату»; "
+                "для отмены — «отмена». Точное время, если оно требуется, укажите отдельно, например 15:30."
+            )
+        return "Уточните параметр. Напишите «отмена», чтобы прекратить операцию."
+
+    def _suggest_pending_value(self, pending):
+        """Ask local LLM for a candidate, validate it, and keep it uncommitted."""
+        field = self._pending_field(pending)
+        now = self.clock()
+        value = None
+        source = "rule"
+        suggest = getattr(self.llm, "suggest_parameter", None)
+        if callable(suggest):
+            try:
+                candidate = suggest(
+                    field=field,
+                    title=pending.get("title", "запись"),
+                    now_iso=now.isoformat(timespec="minutes"),
+                    date_text=pending.get("date_text", ""),
+                )
+                if field == "time" and candidate:
+                    parsed_time = self._extract_explicit_time(candidate)
+                    if parsed_time is not None:
+                        target_text = pending.get("date_text", "")
+                        target_dt = self._parse_date(target_text) if target_text else None
+                        target_is_today = bool(target_dt and datetime.fromisoformat(target_dt).date() == now.date())
+                        proposed_dt = now.replace(hour=parsed_time[0], minute=parsed_time[1], second=0, microsecond=0)
+                        if not target_is_today or proposed_dt > now:
+                            value = f"{parsed_time[0]:02d}:{parsed_time[1]:02d}"
+                            source = "model"
+                elif field == "date" and candidate:
+                    # Strip a model-added clock component: this is a date proposal,
+                    # and must not overwrite a time the user already supplied.
+                    date_candidate = candidate[:10] if re.match(r"^\d{4}-\d{2}-\d{2}T", candidate) else candidate
+                    parsed_date = self._parse_date(date_candidate)
+                    if parsed_date and datetime.fromisoformat(parsed_date).date() >= now.date():
+                        candidate_day = datetime.fromisoformat(parsed_date).date()
+                        existing_time = pending.get("time_value")
+                        candidate_is_past = bool(
+                            candidate_day == now.date() and existing_time is not None
+                            and datetime.combine(candidate_day, datetime.min.time()).replace(
+                                hour=existing_time[0], minute=existing_time[1]
+                            ) <= now
+                        )
+                        if not candidate_is_past:
+                            value = date_candidate
+                            source = "model"
+            except Exception:
+                # The rule-based proposal below is the safe offline fallback.
+                value = None
+
+        if value is None and field == "date":
+            value = "завтра"
+            label = self._format_date_only(now + timedelta(days=1))
+        elif value is None and field == "time":
+            # A fallback is a proposal, not a default. Never suggest a time that
+            # has already passed when the requested date is today.
+            target_text = pending.get("date_text", "")
+            target_dt = self._parse_date(target_text) if target_text else None
+            target_is_today = False
+            if target_dt:
+                try:
+                    target_is_today = datetime.fromisoformat(target_dt).date() == now.date()
+                except ValueError:
+                    target_is_today = False
+            if target_is_today:
+                if now.hour >= 23:
+                    return (
+                        "На сегодня уже нет будущего полного часа для предложения. "
+                        "Укажите точное время вручную, измените дату новой командой или напишите «отмена»."
+                    )
+                value = f"{now.hour + 1:02d}:00"
+            else:
+                value = "15:00"
+            label = value
+        elif field == "date":
+            parsed_date = self._parse_date(value)
+            label = self._format_date_only(parsed_date) if parsed_date else value
+        elif field == "time":
+            label = value
+        else:
+            return "Не могу предложить параметр для этого уточнения. Ответьте на вопрос или напишите «отмена»."
+
+        pending["suggestion"] = {"field": field, "value": value, "label": label, "source": source}
+        self.pending_clarification = pending
+        parameter = "дату" if field == "date" else "время"
+        proposal_source = "локальная модель предлагает" if source == "model" else "предлагаю как запасной вариант"
+        return (
+            f"Предлагаю {parameter}: {label} ({proposal_source}). "
+            "Это только предложение: запись пока не создаётся и не изменяется. "
+            "Ответьте «да», чтобы подтвердить, или введите собственное значение. Для отмены — «отмена»."
+        )
+
+    def _invalid_pending_reply(self, pending, user_text, field):
+        pending["attempts"] = int(pending.get("attempts", 0)) + 1
+        pending.pop("suggestion", None)
+        # Do not trap the user in an endless clarification loop. No write has
+        # happened yet; after three invalid answers, abandon the pending action.
+        if pending["attempts"] >= 3:
+            self.pending_clarification = None
+            action = "создание не выполнено" if pending.get("type", "").startswith("create") else "изменение не выполнено"
+            return (
+                f"Не удалось распознать {field} за три попытки; {action}, данные не изменены. "
+                "Начните команду заново или введите ответ текстом."
+            )
+        self.pending_clarification = pending
+        prompt = self._pending_prompt(pending, invalid_text=user_text)
+        if pending["attempts"] >= 2:
+            prompt += " Если голос распознаётся неверно, введите значение текстом или напишите «предложи» для варианта."
+        return prompt
 
     def _finish_pending_clarification(self, user_text):
         pending = self.pending_clarification
         if not pending:
             return None
-        normalized = user_text.casefold().strip(" .!?")
-        if normalized in {"отмена", "отмени", "не надо", "нет", "забудь", "отменить"}:
+        normalized = user_text.casefold().replace("ё", "е").strip(" .!?")
+        pending_type = pending.get("type", "")
+        field = self._pending_field(pending)
+
+        # An explicit new command must not be swallowed as an attempted date/time
+        # answer. Drop the unfinished (not-yet-committed) operation and handle it.
+        if field in {"date", "time"} and self._looks_like_new_command(user_text):
             self.pending_clarification = None
-            return "Хорошо, создание записи отменено."
+            return "Предыдущее уточнение отменено. " + self.handle(user_text)
+
+        # Cancellation has priority over suggestion rejection. In particular,
+        # "не надо" means abandon the operation, not merely reject one proposal.
+        cancel_requested = normalized in {
+            "отмена", "отмени", "не надо", "забудь", "отменить",
+            "отмени операцию", "отменить операцию",
+        } or bool(re.fullmatch(r"(?:нет[, ]+)?(?:не надо|отмена|отмени|отменить|забудь)(?: операцию)?", normalized))
+        if cancel_requested:
+            self.pending_clarification = None
+            if pending_type.startswith("create"):
+                return "Хорошо, создание записи отменено."
+            return "Хорошо, изменение записи отменено."
+
+        # Suggestions are opt-in: accepting uses the proposed value; rejecting it
+        # keeps the dialog open and asks for a different value.
+        suggestion = pending.get("suggestion")
+        if suggestion and self._is_yes(normalized):
+            user_text = str(suggestion["value"])
+            normalized = user_text.casefold()
+            pending.pop("suggestion", None)
+            pending["attempts"] = 0
+        elif suggestion and self._is_no(normalized):
+            pending.pop("suggestion", None)
+            pending["attempts"] = int(pending.get("attempts", 0)) + 1
+            if pending["attempts"] >= 3:
+                self.pending_clarification = None
+                action = "создание не выполнено" if pending_type.startswith("create") else "изменение не выполнено"
+                return (
+                    f"Три предложенных варианта отклонены; {action}, данные не изменены. "
+                    "Начните команду заново или введите точное значение."
+                )
+            self.pending_clarification = pending
+            return "Хорошо, этот вариант не использую. " + self._pending_prompt(pending)
+        else:
+            pending.pop("suggestion", None)
+
+        if self._wants_suggestion(user_text) and field in {"date", "time"}:
+            return self._suggest_pending_value(pending)
+
+        # Validate an answer before falling through to the state transition. This
+        # is the key guard against endlessly repeating a time prompt when STT has
+        # produced text that contains no parseable time.
+        if pending_type in {"create_time", "reschedule_time"}:
+            if self._extract_explicit_time(user_text) is None:
+                return self._invalid_pending_reply(pending, user_text, "time")
+        elif pending_type == "create_date":
+            supplied_date = self._extract_date_phrase(user_text)
+            if not supplied_date:
+                supplied_time = self._extract_explicit_time(user_text)
+                if supplied_time is not None:
+                    pending["time_value"] = supplied_time
+                return self._invalid_pending_reply(pending, user_text, "date")
+        elif pending_type == "reschedule_date":
+            supplied_date = self._extract_date_phrase(user_text)
+            supplied_time = self._extract_explicit_time(user_text)
+            current = self.repo.get(pending.get("entry_id"))
+            time_only_can_update = supplied_time is not None and current and current.get("due_at")
+            if not supplied_date and not time_only_can_update:
+                if supplied_time is not None:
+                    pending["time_value"] = supplied_time
+                return self._invalid_pending_reply(pending, user_text, "date")
 
         if pending.get("type") == "rename_title":
             new_title = user_text.strip().strip('«»\"\' ').strip(" .!?")
@@ -348,11 +629,32 @@ class AssistantEngine:
                 resolved_kind = "meeting"
             else:
                 return "Уточните тип записи: задача, напоминание или встреча?"
-            self.pending_clarification = {
-                "type": "create_date", "kind": resolved_kind, "title": pending["title"],
-                "date_text": pending.get("date_text", ""), "time_value": pending.get("time_value"),
-            }
-            return self._finish_pending_clarification(user_text)
+
+            # The answer here supplies only the record kind. Do not recursively
+            # feed the word "напоминание" into the date parser as though it were
+            # a date; continue from the facts collected in the original request.
+            date_text = pending.get("date_text", "")
+            time_value = pending.get("time_value")
+            parsed_date = self._parse_date(date_text) if date_text else None
+            if not parsed_date:
+                next_pending = {
+                    "type": "create_date", "kind": resolved_kind, "title": pending["title"],
+                    "date_text": "", "time_value": time_value, "attempts": 0,
+                }
+                self.pending_clarification = next_pending
+                return self._pending_prompt(next_pending)
+            if time_value is None:
+                next_pending = {
+                    "type": "create_time", "kind": resolved_kind, "title": pending["title"],
+                    "date_text": date_text, "attempts": 0,
+                }
+                self.pending_clarification = next_pending
+                return f"Дата: {self._format_date_only(parsed_date)}. " + self._pending_prompt(next_pending)
+            base = datetime.fromisoformat(parsed_date)
+            due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+            row = self.repo.create(resolved_kind, pending["title"], due_at)
+            self.pending_clarification = None
+            return "Создано: " + self._format_entry(row)
 
         if pending.get("type", "").startswith("reschedule"):
             date_text = pending.get("date_text", "")
@@ -380,19 +682,21 @@ class AssistantEngine:
                         return "Не удалось найти запись для переноса: возможно, её удалили."
                     return "Перенесено: " + self._format_entry(self.repo.get(pending["entry_id"]))
             if not parsed_date:
-                self.pending_clarification = {
+                next_pending = {
                     "type": "reschedule_date", "entry_id": pending["entry_id"],
                     "title": pending["title"], "kind": pending["kind"],
-                    "date_text": "", "time_value": time_value,
+                    "date_text": "", "time_value": time_value, "attempts": 0,
                 }
-                return f"На какую дату перенести «{pending['title']}»?"
+                self.pending_clarification = next_pending
+                return self._pending_prompt(next_pending)
             if time_value is None:
-                self.pending_clarification = {
+                next_pending = {
                     "type": "reschedule_time", "entry_id": pending["entry_id"],
                     "title": pending["title"], "kind": pending["kind"],
-                    "date_text": date_text, "time_value": None,
+                    "date_text": date_text, "time_value": None, "attempts": 0,
                 }
-                return f"Дата: {self._format_date_only(parsed_date)}. На какое точное время перенести «{pending['title']}»?"
+                self.pending_clarification = next_pending
+                return f"Дата: {self._format_date_only(parsed_date)}. " + self._pending_prompt(next_pending)
             base = datetime.fromisoformat(parsed_date)
             due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
             updated = self.repo.update_due(pending["entry_id"], due_at)
@@ -415,13 +719,15 @@ class AssistantEngine:
 
         parsed_date = self._parse_date(date_text) if date_text else None
         if not parsed_date:
-            self.pending_clarification = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": time_value}
-            return f"На какую дату поставить {KIND_ACC_RU[kind]} «{title}»? Укажите дату, например: завтра или 25.10.2026."
+            pending = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": time_value, "attempts": 0}
+            self.pending_clarification = pending
+            return self._pending_prompt(pending)
 
         if not time_value:
-            self.pending_clarification = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text}
+            pending = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text, "attempts": 0}
+            self.pending_clarification = pending
             date_label = self._format_date_only(parsed_date)
-            return f"Дата: {date_label}. На какое точное время поставить {KIND_ACC_RU[kind]} «{title}»?"
+            return f"Дата: {date_label}. " + self._pending_prompt(pending)
 
         base = datetime.fromisoformat(parsed_date)
         due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
@@ -749,11 +1055,13 @@ class AssistantEngine:
             if date_text and not parsed_day:
                 return f"Не смог надёжно разобрать дату «{date_text}». Уточните её, пожалуйста."
             if not parsed_day:
-                self.pending_clarification = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": explicit_time}
-                return f"На какую дату поставить {KIND_ACC_RU[kind]} «{title}»? Укажите дату, например: завтра или 25.10.2026."
+                pending = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": explicit_time, "attempts": 0}
+                self.pending_clarification = pending
+                return self._pending_prompt(pending)
             if not explicit_time:
-                self.pending_clarification = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text}
-                return f"Дата: {self._format_date_only(parsed_day)}. На какое точное время поставить {KIND_ACC_RU[kind]} «{title}»?"
+                pending = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text, "attempts": 0}
+                self.pending_clarification = pending
+                return f"Дата: {self._format_date_only(parsed_day)}. " + self._pending_prompt(pending)
             base = datetime.fromisoformat(parsed_day)
             due_at = base.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
             row = self.repo.create(kind, title, due_at)
@@ -863,19 +1171,21 @@ class AssistantEngine:
                         return "Не удалось изменить срок записи."
                     return "Перенесено: " + self._format_entry(self.repo.get(row["id"]))
             if not date_text or due_at is None:
-                self.pending_clarification = {
+                pending = {
                     "type": "reschedule_date", "entry_id": row["id"],
                     "title": row["title"], "kind": row["kind"],
-                    "date_text": "", "time_value": explicit_time,
+                    "date_text": "", "time_value": explicit_time, "attempts": 0,
                 }
-                return f"На какую дату перенести «{row['title']}»?"
+                self.pending_clarification = pending
+                return self._pending_prompt(pending)
             if explicit_time is None:
-                self.pending_clarification = {
+                pending = {
                     "type": "reschedule_time", "entry_id": row["id"],
                     "title": row["title"], "kind": row["kind"],
-                    "date_text": date_text, "time_value": None,
+                    "date_text": date_text, "time_value": None, "attempts": 0,
                 }
-                return f"Дата: {self._format_date_only(due_at)}. На какое точное время перенести «{row['title']}»?"
+                self.pending_clarification = pending
+                return f"Дата: {self._format_date_only(due_at)}. " + self._pending_prompt(pending)
             parsed_day = datetime.fromisoformat(due_at)
             due_at = parsed_day.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
             self.repo.update_due(row["id"], due_at)

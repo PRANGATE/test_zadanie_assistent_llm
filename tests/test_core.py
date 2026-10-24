@@ -529,5 +529,148 @@ class CoreTests(unittest.TestCase):
         self.assertIn("Название изменено", result)
         self.assertEqual(self.repo.get(row["id"])["title"], "Купить хлеб")
 
+    def test_time_parser_accepts_common_clarification_answers(self):
+        engine = self.engine([])
+        cases = {
+            "15:30": (15, 30),
+            "22:00": (22, 0),
+            "22 00": (22, 0),
+            "10 часов вечера": (22, 0),
+            "10 вечера": (22, 0),
+            "в 15 часов 30 минут": (15, 30),
+            "в 22": (22, 0),
+        }
+        for utterance, expected in cases.items():
+            with self.subTest(utterance=utterance):
+                self.assertEqual(engine._extract_explicit_time(utterance), expected)
+        self.assertIsNone(engine._extract_explicit_time("вечером"))
+        self.assertIsNone(engine._extract_explicit_time("я не знаю"))
+        self.assertIsNone(engine._extract_explicit_time("Купить 5 яблок"))
+
+    def test_invalid_time_answer_has_examples_and_stops_after_three_failures(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу на завтра сходить в парк")
+        self.assertIn("15:30", first)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Не распознал время", engine.handle("не знаю"))
+        self.assertIn("10 часов вечера", engine.handle("как-нибудь вечером"))
+        third = engine.handle("вчера вечером")
+        self.assertIn("за три попытки", third)
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_new_command_interrupts_pending_time_question(self):
+        self.repo.create("task", "Активная задача", "2026-10-21T10:00")
+        engine = self.engine([
+            {"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""},
+            {"action": "search", "kind": "task", "title": "Активная задача", "date_text": "", "period": "all", "target_id": None, "clarification": ""},
+        ])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        result = engine.handle("Покажи активные дела")
+        self.assertIn("Предыдущее уточнение отменено", result)
+        self.assertIn("Активная задача", result)
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(len(self.repo.all()), 1)
+
+    def test_user_can_request_and_confirm_a_time_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу на завтра сходить в парк")
+        self.assertIn("предложи время", first)
+        proposal = engine.handle("предложи время")
+        self.assertIn("Предлагаю время: 15:00", proposal)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("да"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
+
+    def test_model_proposal_is_validated_and_not_saved_without_confirmation(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить хлеб", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра купить хлеб")
+        engine.llm.suggest_parameter = lambda **kwargs: "16:15"
+        proposal = engine.handle("предложи время")
+        self.assertIn("16:15", proposal)
+        self.assertIn("локальная модель предлагает", proposal)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("да"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:15")
+
+    def test_user_can_request_and_confirm_a_date_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить хлеб", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу купить хлеб в 16:00")
+        self.assertIn("На какую дату", first)
+        proposal = engine.handle("предложи дату")
+        self.assertIn("Предлагаю дату: 21 октября 2026 года", proposal)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("да"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:00")
+
+    def test_user_can_reject_suggestion_and_enter_own_time(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.handle("предложи время")
+        rejected = engine.handle("нет")
+        self.assertIn("этот вариант не использую", rejected)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("10 часов вечера"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T22:00")
+
+    def test_time_clarification_reschedule_accepts_spoken_hour_format(self):
+        row = self.repo.create("meeting", "Встреча со Стасом", "2026-10-26T20:00")
+        engine = self.engine([{"action": "reschedule", "kind": "meeting", "title": "Встреча со Стасом", "date_text": "завтра", "period": "", "target_id": row["id"], "clarification": ""}])
+        first = engine.handle("Перенеси встречу «Встреча со Стасом» на завтра")
+        self.assertIn("точное время", first)
+        result = engine.handle("10 часов вечера")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T22:00")
+
+    def test_ai_proposal_accepts_natural_confirmation(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.llm.suggest_parameter = lambda **kwargs: "16:15"
+        engine.handle("предложи время")
+        result = engine.handle("Да, хорошо")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:15")
+
+    def test_not_need_cancels_pending_operation_even_after_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.handle("предложи время")
+        result = engine.handle("не надо")
+        self.assertIn("создание записи отменено", result.casefold())
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_declining_three_ai_suggestions_does_not_loop_forever(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        for attempt in range(3):
+            proposal = engine.handle("предложи время")
+            self.assertIn("Предлагаю время", proposal)
+            if attempt < 2:
+                response = engine.handle("нет")
+                self.assertIn("этот вариант не использую", response)
+        result = engine.handle("нет")
+        self.assertIn("Три предложенных варианта отклонены", result)
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_combined_no_and_cancel_phrase_cancels_pending_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.handle("предложи время")
+        result = engine.handle("нет, не надо")
+        self.assertIn("создание записи отменено", result.casefold())
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_time_suggestion_never_falls_back_to_past_time_today(self):
+        late_now = datetime(2026, 10, 20, 23, 30)
+        engine = AssistantEngine(FakeLLM([{"action": "create", "kind": "task", "title": "Проверить дверь", "date_text": "сегодня", "period": "", "target_id": None, "clarification": ""}]), self.repo, clock=lambda: late_now)
+        engine.handle("Добавь задачу сегодня проверить дверь")
+        result = engine.handle("предложи время")
+        self.assertIn("уже нет будущего полного часа", result)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIsNotNone(engine.pending_clarification)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

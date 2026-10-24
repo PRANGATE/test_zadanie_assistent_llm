@@ -45,8 +45,15 @@ class App:
         self.text_input.bind("<Return>", lambda _event: self.submit_text())
         self.send_button = ttk.Button(row, text="Отправить", command=self.submit_text, state="disabled")
         self.send_button.pack(side="left", padx=(8, 0))
+        ttk.Label(
+            outer,
+            text=("Подсказка: дата — «завтра» или «26.10.2026»; время — «15:30», «22 00» "
+                  "или «10 часов вечера». Напишите «предложи», чтобы получить вариант ассистента; "
+                  "«отмена» прекращает текущее уточнение."),
+            wraplength=760, foreground="#555555", justify="left",
+        ).pack(fill="x", anchor="w", pady=(5, 0))
 
-        ttk.Label(outer, text="История диалога", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(16, 4))
+        ttk.Label(outer, text="История диалога", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(12, 4))
         self.history = tk.Text(outer, height=16, wrap="word", state="disabled", font=("Segoe UI", 10))
         self.history.pack(fill="both", expand=True)
         self._append("Ассистент", "Запускаю локальные модели. Данные хранятся на этом компьютере.")
