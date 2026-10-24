@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import re
 
 from .database import Repository
+from .semantic_search import SemanticSearch
 
 KIND_RU = {"task": "задача", "reminder": "напоминание", "meeting": "встреча"}
 STATUS_RU = {"open": "активна", "done": "выполнена"}
@@ -26,10 +27,12 @@ WEEKDAYS = {
 
 
 class AssistantEngine:
-    def __init__(self, llm, repo=None, clock=None):
+    def __init__(self, llm, repo=None, clock=None, semantic_search=None):
         self.llm = llm
         self.repo = repo or Repository()
         self.clock = clock or datetime.now
+        self.semantic_search = semantic_search or SemanticSearch()
+        self.pending_clarification = None
 
     def _summary(self):
         return "\n".join(
@@ -182,7 +185,7 @@ class AssistantEngine:
             r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|запиши|записать|поставь|поставить|напомни|напомнить)\s+",
             "", text, flags=re.IGNORECASE,
         )
-        text = re.sub(r"^(?:мне\s+)?(?:задачу|задача|задачку|напоминание|напоминалку|встречу)\b\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:мне\s+)?(?:задачу|задача|задачку|напоминание|напоминалку)\b\s*", "", text, flags=re.IGNORECASE)
         # Remove temporal phrases from the title, but leave the actual action.
         text = re.sub(r"\bна\s+(?:послезавтра|завтра|сегодня)\b", " ", text, flags=re.IGNORECASE)
         text = re.sub(r"\b(?:послезавтра|завтра|сегодня)\b", " ", text, flags=re.IGNORECASE)
@@ -192,10 +195,60 @@ class AssistantEngine:
         text = re.sub(r"\b(?:в|на)\s*\d{1,2}(?::\d{2})?(?:\s*час(?:а|ов)?)?(?:\s+(?:утра|дня|вечера|ночи))?\b", " ", text, flags=re.IGNORECASE)
         text = re.sub(r"\bв\s+обед\b|\bобед(?:ом)?\b|\bутром\b|\bвечером\b|\bночью\b", " ", text, flags=re.IGNORECASE)
         text = re.sub(r"\s+", " ", text).strip(" -—,:;.!?\t")
+        # Preserve a meaningful meeting title after stripping the command verb.
+        if re.match(r"^встречу\b", text, flags=re.IGNORECASE):
+            text = re.sub(r"^встречу\b", "Встреча", text, count=1, flags=re.IGNORECASE)
         # Do not replace a potentially useful model title with a tiny/noisy fragment.
         if len(text) >= 3:
             return text[0].upper() + text[1:]
         return ""
+
+    def _extract_explicit_time(self, text):
+        """Return an explicit clock time from a phrase, or None."""
+        text = (text or "").casefold()
+        match = re.search(r"(?:\bв\s*|\bна\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:час(?:а|ов)?\b)?(?:\s+(утра|дня|вечера|ночи))?", text)
+        if match:
+            h = int(match.group(1)); minute = int(match.group(2) or 0); suffix = match.group(3)
+            # Reject incidental small numbers unless they are explicitly introduced or have a suffix.
+            introduced = re.search(r"\b(?:в|на)\s*\d", text) or ":" in match.group(0) or "час" in match.group(0) or suffix
+            if introduced:
+                if suffix in {"дня", "вечера"} and 1 <= h <= 11:
+                    h += 12
+                elif suffix == "ночи" and h == 12:
+                    h = 0
+                if 0 <= h <= 23 and 0 <= minute <= 59:
+                    return h, minute
+        for phrase, value in (("в обед", (13, 0)), ("обед", (13, 0)), ("утром", (9, 0)), ("вечером", (18, 0)), ("ночью", (22, 0))):
+            if re.search(rf"\b{re.escape(phrase)}\b", text):
+                return value
+        return None
+
+    def _finish_pending_clarification(self, user_text):
+        pending = self.pending_clarification
+        if not pending:
+            return None
+        normalized = user_text.casefold().strip(" .!?")
+        if normalized in {"отмена", "отмени", "не надо", "нет", "забудь"}:
+            self.pending_clarification = None
+            return "Хорошо, создание встречи отменено."
+        time_value = self._extract_explicit_time(user_text)
+        date_text = pending.get("date_text", "")
+        if not date_text:
+            date_text = self._extract_date_phrase(user_text)
+        parsed_date = self._parse_date(date_text) if date_text else None
+        if time_value and parsed_date:
+            base = datetime.fromisoformat(parsed_date)
+            due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+            row = self.repo.create("meeting", pending["title"], due_at)
+            self.pending_clarification = None
+            return "Встреча создана: " + self._format_entry(row)
+        if time_value and not parsed_date:
+            self.pending_clarification = {"type": "meeting_date", "title": pending["title"]}
+            return f"Время понял — {time_value[0]:02d}:{time_value[1]:02d}. На какую дату поставить встречу «{pending['title']}»?"
+        if parsed_date and not time_value:
+            self.pending_clarification = {"type": "meeting_time", "title": pending["title"], "date_text": date_text}
+            return f"На какую дату понял: {self._format_due(parsed_date)}. На какое время поставить встречу «{pending['title']}»?"
+        return "Не расслышал дату или время. Например, ответьте «в 15:00» или «завтра в 15:00»."
 
     def _period_bounds(self, period):
         now = self.clock()
@@ -228,6 +281,8 @@ class AssistantEngine:
         user_text = (user_text or "").strip()
         if not user_text:
             return "Введите запрос или произнесите его в микрофон."
+        if self.pending_clarification:
+            return self._finish_pending_clarification(user_text)
         parsed = self.llm.parse(user_text, self.clock().isoformat(timespec="minutes"), self._summary())
         if not isinstance(parsed, dict):
             return "Не удалось разобрать запрос. Попробуйте сформулировать иначе."
@@ -255,6 +310,22 @@ class AssistantEngine:
         title = str(parsed.get("title") or "").strip()
         date_text = str(parsed.get("date_text") or "").strip()
         source_date = self._extract_date_phrase(user_text)
+        # Do not let the small LLM's generic "clarify" classification bypass the
+        # actual multi-turn meeting flow. Detect explicit meeting-creation wording.
+        meeting_create = bool(re.search(
+            r"\b(?:добавь|добавить|создай|создать|поставь|поставить|запланируй|назначь)\b.{0,50}\bвстреч\w*\b",
+            normalized,
+        ))
+        if meeting_create:
+            action = "create"
+            kind = "meeting"
+            parsed["action"] = action
+            parsed["kind"] = kind
+            extracted_meeting_title = self._extract_title_from_request(user_text)
+            if extracted_meeting_title:
+                title = extracted_meeting_title
+            if source_date:
+                date_text = source_date
         if action == "create":
             # The original utterance is the source of truth for relative dates;
             # small LLMs can hallucinate yesterday's date or return midnight.
@@ -282,7 +353,13 @@ class AssistantEngine:
             if kind == "any":
                 kind = "task"
             if kind == "meeting" and not date_text:
+                self.pending_clarification = {"type": "meeting_date", "title": title}
                 return f"На какую дату и время поставить встречу «{title}»?"
+            if kind == "meeting" and date_text and not self._extract_explicit_time(user_text):
+                self.pending_clarification = {"type": "meeting_time", "title": title, "date_text": date_text}
+                parsed_day = self._parse_date(date_text)
+                when = self._format_due(parsed_day) if parsed_day else date_text
+                return f"Записать встречу «{title}» на {when}. На какое время поставить встречу?"
             if date_text and due_at is None:
                 return f"Не смог надёжно разобрать дату «{date_text}». Уточните её, пожалуйста."
             row = self.repo.create(kind, title, due_at)
@@ -300,10 +377,21 @@ class AssistantEngine:
                 return "За указанный период записей не найдено."
             return "Найдено:\n" + "\n".join(self._format_entry(r) for r in rows[:20])
         if action == "search":
-            rows = self.repo.find(title or user_text, kind)
+            query = title or user_text
+            rows = self.repo.find(query, kind)
+            # If lexical matching is weak or empty, try local multilingual embeddings.
+            if len(rows) < 3:
+                candidates = [r for r in self.repo.all(1000) if kind in {"any", r["kind"]}]
+                try:
+                    semantic_rows = self.semantic_search.rank(user_text, candidates, limit=10)
+                    known = {r["id"] for r in rows}
+                    rows.extend(r for r in semantic_rows if r["id"] not in known)
+                except Exception:
+                    # Semantic model is optional until its first successful local download.
+                    pass
             if not rows:
-                return f"Не нашёл запись по запросу «{title or user_text}»."
-            return "Нашёл:\n" + "\n".join(self._format_entry(r) for r in rows)
+                return f"Не нашёл запись по запросу «{query}»."
+            return "Нашёл:\n" + "\n".join(self._format_entry(r) for r in rows[:10])
         if action in {"delete", "reschedule", "complete"}:
             target_id = parsed.get("target_id")
             row = self.repo.get(target_id) if isinstance(target_id, int) and not isinstance(target_id, bool) else None

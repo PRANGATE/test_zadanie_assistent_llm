@@ -6,6 +6,7 @@ from pathlib import Path
 from assistant.database import Repository
 from assistant.engine import AssistantEngine
 from assistant.engine import speech_friendly_text
+from assistant.semantic_search import SemanticSearch
 
 
 class FakeLLM:
@@ -163,6 +164,61 @@ class CoreTests(unittest.TestCase):
     def test_empty_title_rejected(self):
         with self.assertRaises(ValueError):
             self.repo.create("task", "   ")
+
+    def test_llm_clarify_classification_still_starts_meeting_dialog(self):
+        engine = self.engine([{"action": "clarify", "kind": "meeting", "title": "Встреча с Иваном", "date_text": "завтра", "period": "week", "target_id": None, "clarification": "Уточните время"}])
+        first = engine.handle("Добавь встречу с Иваном завтра")
+        self.assertIn("На какое время", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("в 15:00")
+        self.assertIn("Встреча создана", second)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
+
+    def test_meeting_missing_time_starts_active_clarification(self):
+        engine = self.engine([{"action": "create", "kind": "meeting", "title": "Встреча с Иваном", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь встречу с Иваном завтра")
+        self.assertIn("На какое время", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("в 15:00")
+        self.assertIn("Встреча создана", second)
+        row = self.repo.all()[0]
+        self.assertEqual(row["title"], "Встреча с Иваном")
+        self.assertEqual(row["due_at"], "2026-10-21T15:00")
+
+    def test_meeting_clarification_can_supply_date_and_time(self):
+        engine = self.engine([{"action": "create", "kind": "meeting", "title": "Дизайнер", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь встречу с дизайнером")
+        self.assertIn("На какую дату и время", first)
+        second = engine.handle("в пятницу в 11:30")
+        self.assertIn("Встреча создана", second)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-23T11:30")
+
+    def test_semantic_search_cosine_ranking_with_injected_encoder(self):
+        # Query is close to the first row; the second row is orthogonal.
+        vectors = {
+            "когда обсуждали дизайн": [1.0, 0.0],
+            "meeting. Обсудить макет": [0.9, 0.1],
+            "task. Купить молоко": [0.0, 1.0],
+        }
+        search = SemanticSearch(encoder=lambda texts: [vectors[text] for text in texts])
+        rows = [
+            {"id": 1, "kind": "meeting", "title": "Обсудить макет"},
+            {"id": 2, "kind": "task", "title": "Купить молоко"},
+        ]
+        result = search.rank("когда обсуждали дизайн", rows)
+        self.assertEqual([row["id"] for row in result], [1])
+
+    def test_semantic_search_results_are_added_to_lexical_search(self):
+        row = self.repo.create("meeting", "Обсудить макет с Иваном", "2026-10-21T15:00")
+        class FakeSemantic:
+            def rank(self, query, rows, limit=10):
+                self.assertion = query
+                return [r for r in rows if r["id"] == row["id"]]
+        semantic = FakeSemantic()
+        engine = AssistantEngine(FakeLLM([{"action": "search", "kind": "any", "title": "дизайн", "date_text": "", "period": "all", "target_id": None, "clarification": ""}]), self.repo, clock=lambda: self.fixed_now, semantic_search=semantic)
+        result = engine.handle("Когда мы обсуждали дизайн с Иваном?")
+        self.assertIn("Обсудить макет с Иваном", result)
+        self.assertEqual(semantic.assertion, "Когда мы обсуждали дизайн с Иваном?")
 
     def test_sequential_cross_thread_db_access(self):
         import threading
