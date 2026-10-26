@@ -1,0 +1,2926 @@
+===== assistant\compat.py =====
+"""Small compatibility helpers for third-party package API changes."""
+from packaging.version import Version
+
+
+def transformers_dtype_kwargs(transformers_version: str, dtype):
+    """Return the correct from_pretrained dtype keyword for Transformers version.
+
+    The `dtype` parameter replaced deprecated `torch_dtype` in Transformers 4.56.
+    Keep the legacy branch only for environments below that API threshold.
+    """
+    key = "dtype" if Version(transformers_version) >= Version("4.56.0") else "torch_dtype"
+    return {key: dtype}
+
+===== assistant\config.py =====
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = APP_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "assistant.sqlite3"
+LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+STT_MODEL = "small"
+SAMPLE_RATE = 16_000
+MAX_RECORD_SECONDS = 90
+
+===== assistant\database.py =====
+"""SQLite repository using a short-lived connection per operation.
+
+This avoids SQLite's cross-thread connection error in a Tkinter application.
+"""
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from .config import DB_PATH
+
+
+def re_words(text):
+    return [word.strip(".,!?;:()\"'«»") for word in text.casefold().split()]
+
+
+class Repository:
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = Path(db_path or DB_PATH)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self):
+        con = sqlite3.connect(str(self.db_path), timeout=15)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=15000")
+        con.execute("PRAGMA foreign_keys=ON")
+        return con
+
+    @contextmanager
+    def _connection(self):
+        con = self._connect()
+        try:
+            with con:
+                yield con
+        finally:
+            con.close()
+
+    def _initialize(self):
+        with self._connection() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK(kind IN ('task','reminder','meeting')),
+                    title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+                    due_at TEXT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done'))
+                )
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_entries_due ON entries(due_at)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_entries_status ON entries(status)")
+
+    def create(self, kind, title, due_at=None):
+        if kind not in {"task", "reminder", "meeting"}:
+            raise ValueError("Неизвестный тип записи")
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Название не может быть пустым")
+        created_at = datetime.now().isoformat(timespec="seconds")
+        with self._connection() as con:
+            cur = con.execute(
+                "INSERT INTO entries(kind,title,due_at,created_at,status) VALUES(?,?,?,?, 'open')",
+                (kind, title, due_at, created_at),
+            )
+            entry_id = cur.lastrowid
+        return self.get(entry_id)
+
+    def get(self, entry_id):
+        with self._connection() as con:
+            row = con.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+        return dict(row) if row else None
+
+    def all(self, limit=200, include_done=True):
+        sql = "SELECT * FROM entries"
+        args = []
+        if not include_done:
+            sql += " WHERE status='open'"
+        sql += " ORDER BY CASE WHEN due_at IS NULL THEN 1 ELSE 0 END, due_at ASC, created_at DESC LIMIT ?"
+        args.append(max(1, min(int(limit), 1000)))
+        with self._connection() as con:
+            rows = con.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_due(self, entry_id, due_at):
+        with self._connection() as con:
+            cur = con.execute("UPDATE entries SET due_at=? WHERE id=?", (due_at, entry_id))
+        return cur.rowcount > 0
+
+    def update_title(self, entry_id, title):
+        """Rename an entry without changing its date, kind, or status."""
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Название не может быть пустым")
+        with self._connection() as con:
+            cur = con.execute("UPDATE entries SET title=? WHERE id=?", (title, entry_id))
+        return cur.rowcount > 0
+
+    def delete(self, entry_id):
+        with self._connection() as con:
+            cur = con.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+        return cur.rowcount > 0
+
+    def complete(self, entry_id):
+        with self._connection() as con:
+            cur = con.execute("UPDATE entries SET status='done' WHERE id=?", (entry_id,))
+        return cur.rowcount > 0
+
+    def find(self, query, kind=None, limit=10, include_done=True):
+        terms = [term.casefold().strip(".,!?;:()\"'«»") for term in (query or "").split()]
+        terms = [t for t in terms if len(t) > 2]
+        rows = self.all(limit=1000, include_done=include_done)
+        scored = []
+        for row in rows:
+            if kind and kind != "any" and row["kind"] != kind:
+                continue
+            haystack = f"{row['title']} {row['kind']}".casefold()
+            title_words = re_words(haystack)
+            score = 0
+            for term in terms:
+                if term in haystack:
+                    score += 1
+                elif len(term) >= 6 and any(word.startswith(term[:6]) or term.startswith(word[:6]) for word in title_words if len(word) >= 6):
+                    score += 1
+            if score:
+                scored.append((score, row["created_at"], row))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in scored[:max(1, min(int(limit), 100))]]
+
+    def between(self, start_iso, end_iso, kind=None, include_done=True):
+        sql = "SELECT * FROM entries WHERE due_at IS NOT NULL AND due_at >= ? AND due_at < ?"
+        args = [start_iso, end_iso]
+        if kind and kind != "any":
+            sql += " AND kind=?"
+            args.append(kind)
+        if not include_done:
+            sql += " AND status='open'"
+        sql += " ORDER BY due_at ASC"
+        with self._connection() as con:
+            rows = con.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def close(self):
+        """Compatibility no-op: every method owns and closes its own connection."""
+        return None
+
+===== assistant\engine.py =====
+from datetime import datetime, timedelta
+import re
+
+from .database import Repository
+from .semantic_search import SemanticSearch
+
+KIND_RU = {"task": "задача", "reminder": "напоминание", "meeting": "встреча"}
+KIND_ACC_RU = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}
+STATUS_RU = {"open": "активна", "done": "выполнена"}
+MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+def speech_friendly_text(text):
+    """Remove database IDs and make the spoken answer less technical."""
+    text = re.sub(r"(?<!\w)#\s*\d+\s*", "", str(text))
+    if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text):
+        text = re.sub(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})", r"\3.\2.\1, \4", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+WEEKDAYS = {
+    "понедельник": 0, "понедельника": 0, "понедельнику": 0,
+    "вторник": 1, "вторника": 1, "вторнику": 1,
+    "среда": 2, "среду": 2, "среды": 2, "среде": 2,
+    "четверг": 3, "четверга": 3, "четвергу": 3,
+    "пятница": 4, "пятницу": 4, "пятницы": 4, "пятнице": 4,
+    "суббота": 5, "субботу": 5, "субботы": 5,
+    "воскресенье": 6, "воскресенья": 6, "воскресенью": 6,
+}
+
+RUSSIAN_NUMBERS = {
+    "ноль": 0, "один": 1, "одна": 1, "одно": 1, "одну": 1,
+    "одного": 1, "одной": 1, "одном": 1, "одному": 1,
+    "два": 2, "две": 2, "двух": 2, "двум": 2,
+    "три": 3, "трёх": 3, "трех": 3, "трем": 3, "трём": 3,
+    "четыре": 4, "четырёх": 4, "четырех": 4,
+    "пять": 5, "пяти": 5, "шесть": 6, "шести": 6,
+    "семь": 7, "семи": 7, "восемь": 8, "восьми": 8,
+    "девять": 9, "девяти": 9, "десять": 10, "десяти": 10,
+    "одиннадцать": 11, "одиннадцати": 11,
+    "двенадцать": 12, "двенадцати": 12,
+    "тринадцать": 13, "тринадцати": 13,
+    "четырнадцать": 14, "четырнадцати": 14,
+    "пятнадцать": 15, "пятнадцати": 15,
+    "шестнадцать": 16, "шестнадцати": 16,
+    "семнадцать": 17, "семнадцати": 17,
+    "восемнадцать": 18, "восемнадцати": 18,
+    "девятнадцать": 19, "девятнадцати": 19,
+    "двадцать": 20, "двадцати": 20,
+    "двадцать один": 21, "двадцать одна": 21,
+    "двадцать два": 22, "двадцать две": 22,
+    "двадцать три": 23, "двадцать четыре": 24,
+}
+MONTHS_RU_PARSE = {
+    "января": 1, "январе": 1, "февраля": 2, "феврале": 2,
+    "марта": 3, "марте": 3, "апреля": 4, "апреле": 4,
+    "мая": 5, "июня": 6, "июне": 6, "июля": 7, "июле": 7,
+    "августа": 8, "августе": 8, "сентября": 9, "сентябре": 9,
+    "октября": 10, "октябре": 10, "ноября": 11, "ноябре": 11,
+    "декабря": 12, "декабре": 12,
+}
+
+
+class AssistantEngine:
+    def __init__(self, llm, repo=None, clock=None, semantic_search=None):
+        self.llm = llm
+        self.repo = repo or Repository()
+        self.clock = clock or datetime.now
+        self.semantic_search = semantic_search or SemanticSearch()
+        self.pending_clarification = None
+
+    def _summary(self):
+        return "\n".join(
+            f"ID={r['id']} | {r['kind']} | {r['title']} | {r['due_at'] or 'без даты'} | {r['status']}"
+            for r in self.repo.all(30)
+        )
+
+    @staticmethod
+    def _duration_match(text):
+        text = (text or "").casefold().replace("ё", "ё")
+        if re.search(r"\bчерез\s+полчаса\b", text):
+            return ("minutes", 30, re.search(r"\bчерез\s+полчаса\b", text).group(0))
+        number_words = "|".join(sorted((re.escape(k) for k in RUSSIAN_NUMBERS), key=len, reverse=True))
+        match = re.search(
+            rf"\bчерез\s+(?P<n>\d+|{number_words})\s+(?P<unit>минут\w*|час\w*|дн\w*)\b",
+            text, re.IGNORECASE,
+        )
+        if not match:
+            return None
+        raw_n = match.group("n").casefold()
+        count = int(raw_n) if raw_n.isdigit() else RUSSIAN_NUMBERS.get(raw_n)
+        if count is None:
+            return None
+        unit_raw = match.group("unit").casefold()
+        unit = "minutes" if unit_raw.startswith("минут") else "hours" if unit_raw.startswith("час") else "days"
+        return unit, count, match.group(0)
+
+    def _parse_date(self, date_text):
+        """Parse an explicit date phrase; midnight is a date-only sentinel, never a default appointment time."""
+        if not date_text:
+            return None
+        now = self.clock()
+        raw_text = str(date_text).strip()
+
+        # Accept machine-readable timestamps only when the phrase itself is an ISO value.
+        iso_candidate = raw_text.replace("Z", "+00:00") if raw_text.endswith("Z") else raw_text
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[+-]\d{2}:?\d{2})?)?", iso_candidate):
+            try:
+                parsed_iso = datetime.fromisoformat(iso_candidate)
+                if len(iso_candidate) == 10:
+                    parsed_iso = parsed_iso.replace(hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    parsed_iso = parsed_iso.replace(second=0, microsecond=0)
+                if parsed_iso.tzinfo is not None:
+                    # Preserve the wall-clock value supplied in the user's text. Do not
+                    # reinterpret it using the machine timezone of the host environment.
+                    parsed_iso = parsed_iso.replace(tzinfo=None)
+                return parsed_iso.isoformat(timespec="minutes")
+            except ValueError:
+                return None
+
+        text = raw_text.casefold().replace(",", " ").strip()
+        day = None
+        duration = self._duration_match(text)
+        if duration:
+            unit, count, _phrase = duration
+            if unit == "minutes":
+                return (now + timedelta(minutes=count)).replace(second=0, microsecond=0).isoformat(timespec="minutes")
+            if unit == "hours":
+                return (now + timedelta(hours=count)).replace(second=0, microsecond=0).isoformat(timespec="minutes")
+            day = (now + timedelta(days=count)).date()
+        elif re.search(r"\bпослезавтра\b", text):
+            day = (now + timedelta(days=2)).date()
+        elif re.search(r"\bзавтра\b", text):
+            day = (now + timedelta(days=1)).date()
+        elif re.search(r"\bсегодня\b", text):
+            day = now.date()
+        elif re.search(r"\bдо\s+конца\s+недели\b", text):
+            day = (now + timedelta(days=(6 - now.weekday()))).date()
+        else:
+            for word, weekday in sorted(WEEKDAYS.items(), key=lambda x: len(x[0]), reverse=True):
+                if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text):
+                    delta = (weekday - now.weekday()) % 7
+                    day = (now + timedelta(days=delta)).date()
+                    break
+
+        # Explicit dd.mm[.yyyy] / dd-mm[-yyyy].
+        explicit = re.search(r"(?<!\d)(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?(?!\d)", text)
+        if day is None and explicit:
+            d, m, y = int(explicit.group(1)), int(explicit.group(2)), explicit.group(3)
+            year = int(y) if y else now.year
+            if year < 100:
+                year += 2000
+            try:
+                day = datetime(year, m, d).date()
+                if not y and day < now.date():
+                    day = day.replace(year=day.year + 1)
+            except ValueError:
+                return None
+
+        # Russian written month dates: "25 октября" / "25 октября 2026".
+        if day is None:
+            month_pattern = "|".join(sorted((re.escape(m) for m in MONTHS_RU_PARSE), key=len, reverse=True))
+            verbal = re.search(rf"(?<!\d)(\d{{1,2}})\s+({month_pattern})(?:\s+(\d{{4}}))?", text)
+            if verbal:
+                d = int(verbal.group(1)); m = MONTHS_RU_PARSE[verbal.group(2)]
+                year = int(verbal.group(3) or now.year)
+                try:
+                    day = datetime(year, m, d).date()
+                    if not verbal.group(3) and day < now.date():
+                        day = day.replace(year=day.year + 1)
+                except ValueError:
+                    return None
+
+        # Extract only a clearly introduced/colon-formatted clock time. Strip date numerals
+        # first, so a date like 25.10.2026 can never be misread as 25:00.
+        clock_source = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?\b", " ", text)
+        clock_source = re.sub(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?(?!\d)", " ", clock_source)
+        time_value = self._extract_explicit_time(clock_source)
+        if day is not None:
+            hour, minute = time_value if time_value is not None else (0, 0)
+            return datetime(day.year, day.month, day.day, hour, minute).isoformat(timespec="minutes")
+
+        # A time without a date is intentionally not converted into today's date.
+        return None
+
+    def _extract_date_phrase(self, user_text):
+        """Extract date/duration facts from the user's words, never from model guesses."""
+        text = (user_text or "").casefold()
+
+        duration = self._duration_match(text)
+        if duration and duration[0] in {"minutes", "hours"}:
+            return duration[2]
+        if re.search(r"\bпослезавтра\b", text):
+            date_phrase = "послезавтра"
+        elif re.search(r"\bзавтра\b", text):
+            date_phrase = "завтра"
+        elif re.search(r"\bсегодня\b", text):
+            date_phrase = "сегодня"
+        elif re.search(r"\bдо\s+конца\s+недели\b", text):
+            date_phrase = "до конца недели"
+        else:
+            date_phrase = ""
+            for word in sorted(WEEKDAYS, key=len, reverse=True):
+                match = re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text)
+                if match:
+                    date_phrase = match.group(0)
+                    break
+            if not date_phrase:
+                iso = re.search(r"\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?\b", text)
+                explicit = re.search(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?(?!\d)", text)
+                month_pattern = "|".join(sorted((re.escape(m) for m in MONTHS_RU_PARSE), key=len, reverse=True))
+                verbal = re.search(rf"(?<!\d)\d{{1,2}}\s+(?:{month_pattern})(?:\s+\d{{4}})?", text)
+                date_match = iso or explicit or verbal
+                if date_match:
+                    date_phrase = date_match.group(0)
+
+        if not date_phrase:
+            if duration and duration[0] == "days":
+                return duration[2]
+            return ""
+
+        # Capture an explicitly stated time anywhere in the utterance, but not a number
+        # belonging to a calendar date. Relative hour/minute durations already include time.
+        time_value = self._extract_explicit_time(text)
+        if time_value is not None:
+            return f"{date_phrase} в {time_value[0]:02d}:{time_value[1]:02d}"
+        return date_phrase
+
+    def _extract_title_from_request(self, user_text):
+        """Extract a human task title from common Russian commands/utterances."""
+        text = re.sub(r"\s+", " ", (user_text or "").strip()).strip(" .!?\t")
+        text = re.sub(
+            r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|запиши|записать|поставь|поставить|напомни|напомнить|назначь|назначить|запланируй|запланировать)\s+",
+            "", text, flags=re.IGNORECASE,
+        )
+        text = re.sub(r"^(?:(?:мне|нам)\s+)?(?:задачу|задача|задачку|напоминание|напоминалку)\b\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:мне\s+)?", "", text, flags=re.IGNORECASE)
+        # Remove explicit and relative date phrases from the title.
+        temporal_patterns = [
+            r"\bчерез\s+(?:\d+|одиннадцать|двенадцать|тринадцать|четырнадцать|пятнадцать|шестнадцать|семнадцать|восемнадцать|девятнадцать|двадцать(?:\s+(?:один|одна|два|две|три|четыре))?|один|одна|одно|одну|две|два|двух|три|трёх|трех|четыре|четырёх|четырех|пять|пяти|шесть|шести|семь|семи|восемь|восьми|девять|девяти|десять|десяти)\s+(?:минут\w*|час\w*|дн\w*)",
+            r"\bчерез\s+полчаса\b", r"\bдо\s+конца\s+недели\b",
+            r"\bна\s+(?:послезавтра|завтра|сегодня)\b", r"\b(?:послезавтра|завтра|сегодня)\b",
+            r"\b(?:на\s+)?(?:следующей\s+неделе|этой\s+неделе)\b",
+            r"\b(?:на\s+)?\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?\b",
+            r"\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?\b",
+            r"\b(?:в|на)\s*\d{1,2}(?::\d{2})?(?:\s*час(?:а|ов)?)?(?:\s+(?:утра|дня|вечера|ночи))?\b",
+            r"\b\d{1,2}\s+(?:утра|дня|вечера|ночи)\b",
+            r"\bв\s+обед\b|\bобед(?:ом)?\b|\bутром\b|\bвечером\b|\bночью\b",
+        ]
+        for pattern in temporal_patterns:
+            text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+        for weekday in sorted(WEEKDAYS, key=len, reverse=True):
+            text = re.sub(rf"\b(?:на\s+)?{re.escape(weekday)}\b", " ", text, flags=re.IGNORECASE)
+        month_pattern = "|".join(sorted((re.escape(m) for m in MONTHS_RU_PARSE), key=len, reverse=True))
+        text = re.sub(rf"\b\d{{1,2}}\s+(?:{month_pattern})(?:\s+\d{{4}})?\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" -—,:;.!?\t")
+        text = re.sub(r"^(?:в|на)\s+(?=(?:(?:мне|нам|у меня|у нас)\s+)?(?:нужно|надо|необходимо|пора|у меня|у нас|встреча|отправить|позвонить|купить|сделать)\b)", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:(?:мне|нам|у меня|у нас)\s+)?(?:нужно|надо|необходимо|пора)\s+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:у меня|у нас)\s+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:встреча|встречу)\s+", "Встреча ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" -—,:;.!?\t")
+        if len(text) >= 3:
+            return text[0].upper() + text[1:]
+        return ""
+
+    def _extract_explicit_time(self, text):
+        """Return a clearly stated clock time or relative hours/minutes.
+
+        Accepted forms include 15:30, 22 00, "10 часов вечера",
+        "в 15 часов 30 минут", and relative phrases like "через два часа".
+        Vague dayparts such as "вечером" are deliberately not exact times.
+        """
+        text = (text or "").casefold().replace("ё", "е").strip()
+        duration = self._duration_match(text)
+        if duration and duration[0] in {"minutes", "hours"}:
+            delta = timedelta(minutes=duration[1]) if duration[0] == "minutes" else timedelta(hours=duration[1])
+            due = (self.clock() + delta).replace(second=0, microsecond=0)
+            return due.hour, due.minute
+        if duration and duration[0] == "days":
+            text = text.replace(duration[2], " ", 1)
+
+        # Remove date tokens so a date like 26.10.2026 is never treated as a time.
+        cleaned = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?\b", " ", text)
+        cleaned = re.sub(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?(?!\d)", " ", cleaned)
+
+        found = None
+        # Colon time, with or without a preposition.
+        for pattern in (
+            r"\b(?:в|на)\s*(\d{1,2})\s*:\s*(\d{2})\b",
+            r"\b(\d{1,2})\s*:\s*(\d{2})\b",
+        ):
+            match = re.search(pattern, cleaned)
+            if match:
+                found = (int(match.group(1)), int(match.group(2)), None)
+                break
+
+        # Spoken numeric form: "в 22 00" / "22 00". The bare form is only
+        # accepted when the whole utterance is just a time, to avoid reading
+        # arbitrary number pairs in a command as hours/minutes.
+        if found is None:
+            spaced_time = re.fullmatch(r"\s*(?:(?:в|на)\s*)?(\d{1,2})\s+(\d{2})\s*", cleaned)
+            if spaced_time:
+                found = (int(spaced_time.group(1)), int(spaced_time.group(2)), None)
+            else:
+                spaced_in_sentence = re.search(r"\b(?:в|на)\s+(\d{1,2})\s+(\d{2})\b", cleaned)
+                if spaced_in_sentence:
+                    found = (int(spaced_in_sentence.group(1)), int(spaced_in_sentence.group(2)), None)
+
+        # Spoken hour forms: "10 часов вечера", "в 15 часов 30 минут",
+        # "10 вечера", and "в 22". Optional prepositions allow users to answer
+        # a clarification with only the time phrase.
+        if found is None:
+            # A bare number inside a task title is not a time. Require a time
+            # preposition, an explicit "часов" marker, or a daypart suffix.
+            hour_patterns = (
+                r"\b(?:в|на)\s*(\d{1,2})(?:\s*час(?:а|ов)?)?(?:\s+(\d{1,2})\s*минут\w*)?(?:\s+(утра|дня|вечера|ночи))?\b",
+                r"\b(\d{1,2})\s*час(?:а|ов)(?:\s+(\d{1,2})\s*минут\w*)?(?:\s+(утра|дня|вечера|ночи))?\b",
+                r"\b(\d{1,2})\s+(утра|дня|вечера|ночи)\b",
+            )
+            for index, pattern in enumerate(hour_patterns):
+                match = re.search(pattern, cleaned)
+                if not match:
+                    continue
+                hour = int(match.group(1))
+                if index in (0, 1):
+                    minute = int(match.group(2) or 0)
+                    suffix = match.group(3)
+                else:
+                    minute = 0
+                    suffix = match.group(2)
+                found = (hour, minute, suffix)
+                break
+
+        # A plain integer is accepted only when the entire response is a time,
+        # e.g. a user answers "22" to the question about the exact time.
+        if found is None:
+            bare_hour = re.fullmatch(r"\s*(?:(?:в|на)\s*)?(\d{1,2})(?:\s*час(?:а|ов)?)?\s*", cleaned)
+            if bare_hour:
+                found = (int(bare_hour.group(1)), 0, None)
+
+        if found is None:
+            return None
+        hour, minute, suffix = found
+        if suffix in {"дня", "вечера"} and 1 <= hour <= 11:
+            hour += 12
+        elif suffix in {"утра", "ночи"} and hour == 12:
+            hour = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+        return None
+
+    @staticmethod
+    def _is_yes(text):
+        normalized = re.sub(r"[.!?]+$", "", (text or "").casefold().replace("ё", "е")).strip()
+        return bool(re.fullmatch(
+            r"(?:да(?:\s*[, ]\s*(?:давай|хорошо|отлично|подходит|подойдет|принимаю|согласен|согласна))?|"
+            r"ага|конечно|подходит|подойдет|принимаю|согласен|согласна|ок|хорошо|отлично|подтверждаю)",
+            normalized,
+        ))
+
+    @staticmethod
+    def _is_no(text):
+        normalized = re.sub(r"[.!?]+$", "", (text or "").casefold().replace("ё", "е")).strip()
+        return bool(re.fullmatch(
+            r"(?:нет(?:\s*[, ]\s*(?:не подходит|другой вариант|предложи другой))?|"
+            r"не подходит|другой вариант|предложи другой)", normalized,
+        ))
+
+    @staticmethod
+    def _wants_suggestion(text):
+        return bool(re.search(r"\b(?:предложи|предложение|подскажи|порекомендуй|вариант|что посоветуешь)\b", (text or "").casefold()))
+
+    @staticmethod
+    def _looks_like_new_command(text):
+        """Recognize a fresh command while a date/time clarification is pending."""
+        normalized = (text or "").casefold().replace("ё", "е").strip()
+        return bool(re.match(
+            r"^(?:(?:ну|ладно|слушай|да)\s+)?(?:(?:иди|пожалуйста)\s+)?(?:покажи|показать|выведи|вывести|список|найди|найти|создай|создать|добавь|добавить|запланируй|запланировать|удали|удалить|перенеси|перенести|переименуй|переименовать|измени|изменить|поменяй|поменять|отметь|отметить|заверши|завершить|какие\s+задачи|активные\s+дела)\b",
+            normalized,
+        ))
+
+    def _pending_field(self, pending):
+        kind = pending.get("type", "")
+        if kind in {"create_time", "reschedule_time"}:
+            return "time"
+        if kind in {"create_date", "reschedule_date"}:
+            return "date"
+        return "other"
+
+    def _pending_prompt(self, pending, invalid_text=None):
+        """Short, field-specific clarification with explicit examples and escape routes."""
+        field = self._pending_field(pending)
+        title = pending.get("title", "записи")
+        kind = pending.get("kind", "task")
+        action_word = "перенести" if pending.get("type", "").startswith("reschedule") else "поставить"
+        if field == "time":
+            known_date = pending.get("date_text")
+            prefix = "Не распознал время" + (f' «{invalid_text.strip()}»' if invalid_text else "") + ". " if invalid_text else ""
+            return (
+                f"{prefix}Укажите точное время для «{title}»: 15:30, 22:00, «10 часов вечера» или «22 00». "
+                "Чтобы получить вариант ассистента, напишите «предложи время»; чтобы отменить операцию — «отмена». "
+                "Можно ввести ответ текстом, если распознавание речи ошибается."
+            )
+        if field == "date":
+            prefix = "Не распознал дату" + (f' «{invalid_text.strip()}»' if invalid_text else "") + ". " if invalid_text else ""
+            return (
+                f"{prefix}На какую дату {action_word} запись «{title}»? Примеры: «сегодня», «завтра», "
+                "«послезавтра», «в пятницу» или «26.10.2026». Чтобы получить вариант ассистента, напишите «предложи дату»; "
+                "для отмены — «отмена». Точное время, если оно требуется, укажите отдельно, например 15:30."
+            )
+        return "Уточните параметр. Напишите «отмена», чтобы прекратить операцию."
+
+    def _suggest_pending_value(self, pending):
+        """Ask local LLM for a candidate, validate it, and keep it uncommitted."""
+        field = self._pending_field(pending)
+        now = self.clock()
+        value = None
+        source = "rule"
+        suggest = getattr(self.llm, "suggest_parameter", None)
+        if callable(suggest):
+            try:
+                candidate = suggest(
+                    field=field,
+                    title=pending.get("title", "запись"),
+                    now_iso=now.isoformat(timespec="minutes"),
+                    date_text=pending.get("date_text", ""),
+                )
+                if field == "time" and candidate:
+                    parsed_time = self._extract_explicit_time(candidate)
+                    if parsed_time is not None:
+                        target_text = pending.get("date_text", "")
+                        target_dt = self._parse_date(target_text) if target_text else None
+                        target_is_today = bool(target_dt and datetime.fromisoformat(target_dt).date() == now.date())
+                        proposed_dt = now.replace(hour=parsed_time[0], minute=parsed_time[1], second=0, microsecond=0)
+                        if not target_is_today or proposed_dt > now:
+                            value = f"{parsed_time[0]:02d}:{parsed_time[1]:02d}"
+                            source = "model"
+                elif field == "date" and candidate:
+                    # Strip a model-added clock component: this is a date proposal,
+                    # and must not overwrite a time the user already supplied.
+                    date_candidate = candidate[:10] if re.match(r"^\d{4}-\d{2}-\d{2}T", candidate) else candidate
+                    parsed_date = self._parse_date(date_candidate)
+                    if parsed_date and datetime.fromisoformat(parsed_date).date() >= now.date():
+                        candidate_day = datetime.fromisoformat(parsed_date).date()
+                        existing_time = pending.get("time_value")
+                        candidate_is_past = bool(
+                            candidate_day == now.date() and existing_time is not None
+                            and datetime.combine(candidate_day, datetime.min.time()).replace(
+                                hour=existing_time[0], minute=existing_time[1]
+                            ) <= now
+                        )
+                        if not candidate_is_past:
+                            value = date_candidate
+                            source = "model"
+            except Exception:
+                # The rule-based proposal below is the safe offline fallback.
+                value = None
+
+        if value is None and field == "date":
+            value = "завтра"
+            label = self._format_date_only(now + timedelta(days=1))
+        elif value is None and field == "time":
+            # A fallback is a proposal, not a default. Never suggest a time that
+            # has already passed when the requested date is today.
+            target_text = pending.get("date_text", "")
+            target_dt = self._parse_date(target_text) if target_text else None
+            target_is_today = False
+            if target_dt:
+                try:
+                    target_is_today = datetime.fromisoformat(target_dt).date() == now.date()
+                except ValueError:
+                    target_is_today = False
+            if target_is_today:
+                if now.hour >= 23:
+                    return (
+                        "На сегодня уже нет будущего полного часа для предложения. "
+                        "Укажите точное время вручную, измените дату новой командой или напишите «отмена»."
+                    )
+                value = f"{now.hour + 1:02d}:00"
+            else:
+                value = "15:00"
+            label = value
+        elif field == "date":
+            parsed_date = self._parse_date(value)
+            label = self._format_date_only(parsed_date) if parsed_date else value
+        elif field == "time":
+            label = value
+        else:
+            return "Не могу предложить параметр для этого уточнения. Ответьте на вопрос или напишите «отмена»."
+
+        pending["suggestion"] = {"field": field, "value": value, "label": label, "source": source}
+        self.pending_clarification = pending
+        parameter = "дату" if field == "date" else "время"
+        proposal_source = "локальная модель предлагает" if source == "model" else "предлагаю как запасной вариант"
+        return (
+            f"Предлагаю {parameter}: {label} ({proposal_source}). "
+            "Это только предложение: запись пока не создаётся и не изменяется. "
+            "Ответьте «да», чтобы подтвердить, или введите собственное значение. Для отмены — «отмена»."
+        )
+
+    def _invalid_pending_reply(self, pending, user_text, field):
+        pending["attempts"] = int(pending.get("attempts", 0)) + 1
+        pending.pop("suggestion", None)
+        # Do not trap the user in an endless clarification loop. No write has
+        # happened yet; after three invalid answers, abandon the pending action.
+        if pending["attempts"] >= 3:
+            self.pending_clarification = None
+            action = "создание не выполнено" if pending.get("type", "").startswith("create") else "изменение не выполнено"
+            return (
+                f"Не удалось распознать {field} за три попытки; {action}, данные не изменены. "
+                "Начните команду заново или введите ответ текстом."
+            )
+        self.pending_clarification = pending
+        prompt = self._pending_prompt(pending, invalid_text=user_text)
+        if pending["attempts"] >= 2:
+            prompt += " Если голос распознаётся неверно, введите значение текстом или напишите «предложи» для варианта."
+        return prompt
+
+    def _finish_pending_clarification(self, user_text):
+        pending = self.pending_clarification
+        if not pending:
+            return None
+        normalized = user_text.casefold().replace("ё", "е").strip(" .!?")
+        pending_type = pending.get("type", "")
+        field = self._pending_field(pending)
+
+        # An explicit new command must not be swallowed as an attempted date/time
+        # answer. Drop the unfinished (not-yet-committed) operation and handle it.
+        if field in {"date", "time"} and self._looks_like_new_command(user_text):
+            self.pending_clarification = None
+            return "Предыдущее уточнение отменено. " + self.handle(user_text)
+
+        # Cancellation has priority over suggestion rejection. In particular,
+        # "не надо" means abandon the operation, not merely reject one proposal.
+        cancel_requested = normalized in {
+            "отмена", "отмени", "не надо", "забудь", "отменить",
+            "отмени операцию", "отменить операцию",
+        } or bool(re.fullmatch(r"(?:нет[, ]+)?(?:не надо|отмена|отмени|отменить|забудь)(?: операцию)?", normalized))
+        if cancel_requested:
+            self.pending_clarification = None
+            if pending_type.startswith("create"):
+                return "Хорошо, создание записи отменено."
+            return "Хорошо, изменение записи отменено."
+
+        # Suggestions are opt-in: accepting uses the proposed value; rejecting it
+        # keeps the dialog open and asks for a different value.
+        suggestion = pending.get("suggestion")
+        if suggestion and self._is_yes(normalized):
+            user_text = str(suggestion["value"])
+            normalized = user_text.casefold()
+            pending.pop("suggestion", None)
+            pending["attempts"] = 0
+        elif suggestion and self._is_no(normalized):
+            pending.pop("suggestion", None)
+            pending["attempts"] = int(pending.get("attempts", 0)) + 1
+            if pending["attempts"] >= 3:
+                self.pending_clarification = None
+                action = "создание не выполнено" if pending_type.startswith("create") else "изменение не выполнено"
+                return (
+                    f"Три предложенных варианта отклонены; {action}, данные не изменены. "
+                    "Начните команду заново или введите точное значение."
+                )
+            self.pending_clarification = pending
+            return "Хорошо, этот вариант не использую. " + self._pending_prompt(pending)
+        else:
+            pending.pop("suggestion", None)
+
+        if self._wants_suggestion(user_text) and field in {"date", "time"}:
+            return self._suggest_pending_value(pending)
+
+        # Validate an answer before falling through to the state transition. This
+        # is the key guard against endlessly repeating a time prompt when STT has
+        # produced text that contains no parseable time.
+        if pending_type in {"create_time", "reschedule_time"}:
+            if self._extract_explicit_time(user_text) is None:
+                return self._invalid_pending_reply(pending, user_text, "time")
+        elif pending_type == "create_date":
+            supplied_date = self._extract_date_phrase(user_text)
+            if not supplied_date:
+                supplied_time = self._extract_explicit_time(user_text)
+                if supplied_time is not None:
+                    pending["time_value"] = supplied_time
+                return self._invalid_pending_reply(pending, user_text, "date")
+        elif pending_type == "reschedule_date":
+            supplied_date = self._extract_date_phrase(user_text)
+            supplied_time = self._extract_explicit_time(user_text)
+            current = self.repo.get(pending.get("entry_id"))
+            time_only_can_update = supplied_time is not None and current and current.get("due_at")
+            if not supplied_date and not time_only_can_update:
+                if supplied_time is not None:
+                    pending["time_value"] = supplied_time
+                return self._invalid_pending_reply(pending, user_text, "date")
+
+        if pending.get("type") == "rename_title":
+            new_title = user_text.strip().strip('«»\"\' ').strip(" .!?")
+            if not new_title:
+                return "Введите новое название записи."
+            if len(new_title) > 200:
+                return "Название слишком длинное. Укажите не более 200 символов."
+            updated = self.repo.update_title(pending["entry_id"], new_title)
+            row = self.repo.get(pending["entry_id"]) if updated else None
+            self.pending_clarification = None
+            if not row:
+                return "Не удалось изменить название: запись не найдена."
+            return "Название изменено: " + self._format_entry(row)
+
+        if pending.get("type") == "edit_field":
+            if re.search(r"\b(?:названи\w*|имя|переименован\w*)\b", normalized):
+                self.pending_clarification = {
+                    "type": "rename_title", "entry_id": pending["entry_id"],
+                    "title": pending["title"], "kind": pending["kind"],
+                }
+                return f"Какое новое название задать записи «{pending['title']}»?"
+            if re.search(r"\b(?:дат\w*|врем\w*|срок\w*|перенос\w*)\b", normalized):
+                self.pending_clarification = {
+                    "type": "reschedule_date", "entry_id": pending["entry_id"],
+                    "title": pending["title"], "kind": pending["kind"],
+                    "date_text": "", "time_value": None,
+                }
+                return f"Укажите новую дату и точное время для «{pending['title']}», например: завтра в 15:30."
+            return "Что изменить: название или срок (дату и время)?"
+
+        if pending.get("type") == "create_kind":
+            answer = user_text.casefold()
+            if re.search(r"\b(?:задач\w*|дело)\b", answer):
+                resolved_kind = "task"
+            elif re.search(r"\b(?:напоминани\w*|напоминалк\w*|напомни)\b", answer):
+                resolved_kind = "reminder"
+            elif re.search(r"\b(?:встреч\w*|созвон)\b", answer):
+                resolved_kind = "meeting"
+            else:
+                return "Уточните тип записи: задача, напоминание или встреча?"
+
+            # The answer here supplies only the record kind. Do not recursively
+            # feed the word "напоминание" into the date parser as though it were
+            # a date; continue from the facts collected in the original request.
+            date_text = pending.get("date_text", "")
+            time_value = pending.get("time_value")
+            parsed_date = self._parse_date(date_text) if date_text else None
+            if not parsed_date:
+                next_pending = {
+                    "type": "create_date", "kind": resolved_kind, "title": pending["title"],
+                    "date_text": "", "time_value": time_value, "attempts": 0,
+                }
+                self.pending_clarification = next_pending
+                return self._pending_prompt(next_pending)
+            if time_value is None:
+                next_pending = {
+                    "type": "create_time", "kind": resolved_kind, "title": pending["title"],
+                    "date_text": date_text, "attempts": 0,
+                }
+                self.pending_clarification = next_pending
+                return f"Дата: {self._format_date_only(parsed_date)}. " + self._pending_prompt(next_pending)
+            base = datetime.fromisoformat(parsed_date)
+            due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+            row = self.repo.create(resolved_kind, pending["title"], due_at)
+            self.pending_clarification = None
+            return "Создано: " + self._format_entry(row)
+
+        if pending.get("type", "").startswith("reschedule"):
+            date_text = pending.get("date_text", "")
+            time_value = pending.get("time_value")
+            supplied_date = self._extract_date_phrase(user_text)
+            supplied_time = self._extract_explicit_time(user_text)
+            if supplied_date and not date_text:
+                date_text = supplied_date
+            if supplied_time is not None:
+                time_value = supplied_time
+            parsed_date = self._parse_date(date_text) if date_text else None
+            # A time-only response must not cause the assistant to ask for the date forever.
+            # Preserve the current date when the selected entry already has one.
+            existing = self.repo.get(pending["entry_id"])
+            if not parsed_date and not date_text and time_value is not None and existing and existing.get("due_at"):
+                try:
+                    existing_dt = datetime.fromisoformat(existing["due_at"])
+                    due_at = existing_dt.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+                except (TypeError, ValueError):
+                    due_at = None
+                if due_at:
+                    updated = self.repo.update_due(pending["entry_id"], due_at)
+                    self.pending_clarification = None
+                    if not updated:
+                        return "Не удалось найти запись для переноса: возможно, её удалили."
+                    return "Перенесено: " + self._format_entry(self.repo.get(pending["entry_id"]))
+            if not parsed_date:
+                next_pending = {
+                    "type": "reschedule_date", "entry_id": pending["entry_id"],
+                    "title": pending["title"], "kind": pending["kind"],
+                    "date_text": "", "time_value": time_value, "attempts": 0,
+                }
+                self.pending_clarification = next_pending
+                return self._pending_prompt(next_pending)
+            if time_value is None:
+                next_pending = {
+                    "type": "reschedule_time", "entry_id": pending["entry_id"],
+                    "title": pending["title"], "kind": pending["kind"],
+                    "date_text": date_text, "time_value": None, "attempts": 0,
+                }
+                self.pending_clarification = next_pending
+                return f"Дата: {self._format_date_only(parsed_date)}. " + self._pending_prompt(next_pending)
+            base = datetime.fromisoformat(parsed_date)
+            due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+            updated = self.repo.update_due(pending["entry_id"], due_at)
+            self.pending_clarification = None
+            if not updated:
+                return "Не удалось найти запись для переноса: возможно, её удалили."
+            return "Перенесено: " + self._format_entry(self.repo.get(pending["entry_id"]))
+
+        kind = pending.get("kind", "task")
+        title = pending["title"]
+        date_text = pending.get("date_text", "")
+        time_value = pending.get("time_value")
+        supplied_date = self._extract_date_phrase(user_text)
+        supplied_time = self._extract_explicit_time(user_text)
+
+        if not date_text and supplied_date:
+            date_text = supplied_date
+        if supplied_time:
+            time_value = supplied_time
+
+        parsed_date = self._parse_date(date_text) if date_text else None
+        if not parsed_date:
+            pending = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": time_value, "attempts": 0}
+            self.pending_clarification = pending
+            return self._pending_prompt(pending)
+
+        if not time_value:
+            pending = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text, "attempts": 0}
+            self.pending_clarification = pending
+            date_label = self._format_date_only(parsed_date)
+            return f"Дата: {date_label}. " + self._pending_prompt(pending)
+
+        base = datetime.fromisoformat(parsed_date)
+        due_at = base.replace(hour=time_value[0], minute=time_value[1], second=0, microsecond=0).isoformat(timespec="minutes")
+        row = self.repo.create(kind, title, due_at)
+        self.pending_clarification = None
+        return "Создано: " + self._format_entry(row)
+
+    def _period_bounds(self, period):
+        now = self.clock()
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if period == "today":
+            start, end = today, today + timedelta(days=1)
+        elif period == "tomorrow":
+            start, end = today + timedelta(days=1), today + timedelta(days=2)
+        elif period == "day_after_tomorrow":
+            start, end = today + timedelta(days=2), today + timedelta(days=3)
+        elif period == "next_week":
+            start = today + timedelta(days=7 - today.weekday())
+            end = start + timedelta(days=7)
+        else:  # current calendar week, Monday through next Monday
+            start = today - timedelta(days=today.weekday())
+            end = start + timedelta(days=7)
+        return start.isoformat(timespec="minutes"), end.isoformat(timespec="minutes")
+
+    def _format_date_only(self, value):
+        if not value:
+            return "дата не указана"
+        try:
+            dt = datetime.fromisoformat(str(value))
+            return f"{dt.day} {MONTHS_RU[dt.month - 1]} {dt.year} года"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _format_due(self, value):
+        if not value:
+            return "дата не указана"
+        try:
+            dt = datetime.fromisoformat(str(value))
+            return f"{dt.day} {MONTHS_RU[dt.month - 1]} {dt.year} года, {dt:%H:%M}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _format_entry(self, row):
+        due = self._format_due(row["due_at"])
+        return f"#{row['id']} {KIND_RU[row['kind']]}: «{row['title']}», срок: {due}, статус: {STATUS_RU[row['status']]}"
+
+    def _resolve_mutation_target(self, user_text, parsed_title="", kind="any"):
+        """Resolve a mutation target conservatively; never mutate a fuzzy guess silently.
+
+        Returns (row, candidates, explicit_id). ``explicit_id`` is set even if the ID
+        does not exist, which prevents fallback to a different row.
+        """
+        id_match = re.search(r"(?:#\s*|\b(?:id|номер|запись)\s*#?\s*)(\d+)\b", user_text, re.IGNORECASE)
+        if id_match:
+            explicit_id = int(id_match.group(1))
+            return self.repo.get(explicit_id), [], explicit_id
+
+        normalized = (user_text or "").casefold()
+        all_candidates = self.repo.all(1000)
+        # Prefer a record whose complete stored title occurs verbatim in the command,
+        # even if the LLM guessed the wrong entry kind.
+        literal_direct = [r for r in all_candidates if len(r["title"].strip()) >= 3 and r["title"].casefold() in normalized]
+        if literal_direct:
+            longest = max(len(r["title"]) for r in literal_direct)
+            literal_direct = [r for r in literal_direct if len(r["title"]) == longest]
+            if len(literal_direct) == 1:
+                return literal_direct[0], [], None
+            return None, literal_direct, None
+
+        # Explicit words like "встречу" are stronger evidence than a mistaken LLM
+        # kind label. This matters when a task and a meeting contain similar words.
+        search_kind = kind
+        if re.search(r"\b(?:встреч\w*|созвон\w*)\b", normalized):
+            search_kind = "meeting"
+        elif re.search(r"\b(?:напоминани\w*|напоминалк\w*)\b", normalized):
+            search_kind = "reminder"
+        candidates = [r for r in all_candidates if search_kind in {"any", r["kind"]}]
+        direct = [r for r in candidates if len(r["title"].strip()) >= 3 and r["title"].casefold() in normalized]
+        if direct:
+            longest = max(len(r["title"]) for r in direct)
+            direct = [r for r in direct if len(r["title"]) == longest]
+            if len(direct) == 1:
+                return direct[0], [], None
+            return None, direct, None
+
+        query = (parsed_title or "").strip()
+        if query:
+            exact = [r for r in candidates if r["title"].casefold().strip() == query.casefold()]
+            if len(exact) == 1:
+                return exact[0], [], None
+            if len(exact) > 1:
+                return None, exact, None
+
+        # Search both the title predicted by the LLM and the full original command.
+        # The small LLM may return a grammatical variant of the real title or assign
+        # the wrong kind. If there is no match of that kind, retry across all kinds.
+        # Ambiguous results are still returned to the caller for clarification.
+        queries = []
+        for candidate_query in (query, user_text):
+            candidate_query = (candidate_query or "").strip()
+            if candidate_query and candidate_query.casefold() not in {q.casefold() for q in queries}:
+                queries.append(candidate_query)
+        matches_by_id = {}
+        for candidate_query in queries:
+            for item in self.repo.find(candidate_query, search_kind, limit=10):
+                matches_by_id[item["id"]] = item
+        matches = list(matches_by_id.values())
+        if not matches and kind != "any":
+            for candidate_query in queries:
+                for item in self.repo.find(candidate_query, "any", limit=10):
+                    matches_by_id[item["id"]] = item
+            matches = list(matches_by_id.values())
+        if len(matches) == 1 and query:
+            return matches[0], [], None
+        return None, matches, None
+
+    def _extract_new_title(self, user_text, row):
+        quoted = re.findall(r"[«“\"]([^»”\"]+)[»”\"]", user_text or "")
+        if len(quoted) >= 2:
+            return quoted[-1].strip()
+        id_match = re.search(r"(?:#\s*|\b(?:id|номер|запись)\s*#?\s*)(\d+)\b", user_text or "", re.IGNORECASE)
+        if len(quoted) == 1 and id_match:
+            return quoted[0].strip()
+        source = user_text or ""
+        index = source.casefold().find(row["title"].casefold())
+        if index >= 0:
+            tail = source[index + len(row["title"]):].lstrip('»”"\' \t')
+            tail = re.sub(r"^\s*(?:на|вместо|как|в|будет)\s+", "", tail, flags=re.IGNORECASE)
+            tail = re.sub(r"^\s*(?:новое\s+)?названи\w*\s*[:=]?\s*", "", tail, flags=re.IGNORECASE)
+            tail = tail.strip().strip('«»“”\"\' ').strip(" .!?,;:")
+            # A transition word is required: don't treat trailing politeness words as a title.
+            if tail and not re.fullmatch(r"(?:пожалуйста|название|имя|задачу|задача)", tail, re.IGNORECASE):
+                return tail
+        if id_match:
+            tail = source[id_match.end():]
+            tail = re.sub(r"^\s*(?:задач\w*|дело|дела|запись|напоминани\w*|встреч\w*)\s*", "", tail, flags=re.IGNORECASE)
+            tail = re.sub(r"^\s*(?:на|вместо|как|в|будет)\s+", "", tail, flags=re.IGNORECASE)
+            tail = tail.strip().strip('«»“”\"\' ').strip(" .!?,;:")
+            if tail:
+                return tail
+        return ""
+
+    def handle(self, user_text):
+        user_text = (user_text or "").strip()
+        if not user_text:
+            return "Введите запрос или произнесите его в микрофон."
+        if self.pending_clarification:
+            return self._finish_pending_clarification(user_text)
+        parsed = self.llm.parse(user_text, self.clock().isoformat(timespec="minutes"), self._summary())
+        if not isinstance(parsed, dict):
+            return "Не удалось разобрать запрос. Попробуйте сформулировать иначе."
+
+        # Deterministic safeguards: natural-language facts from the user are authoritative;
+        # a small LLM may classify an action, but cannot invent a deadline/time.
+        normalized = re.sub(r"\s+", " ", user_text.casefold()).strip(" .!?\t")
+        normalized = normalized.replace("ё", "е")
+        period_match = re.search(
+            r"\b(послезавтра|завтра|сегодня|на\s+следующей\s+неделе|на\s+этой\s+неделе|на\s+эту\s+неделю|эту\s+неделю|этой\s+неделе|на\s+неделю)\b",
+            normalized,
+        )
+        list_lead = bool(re.search(
+            r"^(?:вывод\w*|выведи|вывести|покажи|показать|список|какая?\s+задач\w*|какие\s+задач\w*|задач\w*|встреч\w*|событи\w*|напоминани\w*|что\b|что\s+запланировано|(?:какие\s+)?планы\b|есть\s+ли|мои\s+(?:задач\w*|встреч\w*|событи\w*|напоминани\w*)|активн\w*|незаверш[еёе]н\w*|открыт\w*)",
+            normalized,
+        ))
+        asks_for_period = bool(period_match and list_lead)
+        is_create_utterance = bool(re.match(
+            r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|запиши|записать|поставь|поставить|напомни|напомнить|назначь|назначить|запланируй|запланировать)\b",
+            normalized,
+        ))
+        active_query = bool(re.search(r"\b(?:активн\w*|незаверш[еёе]н\w*|открыт\w*)\b", normalized)) and not is_create_utterance
+        natural_task_create = bool(
+            re.search(r"\b(?:нужно|надо|необходимо|пора)\b", normalized)
+            and (self._extract_date_phrase(user_text) or re.search(r"\b(?:задач\w*|отч[её]т|позвонить|отправить|купить|сделать)\b", normalized))
+        )
+        natural_meeting_create = bool(re.search(
+            r"\b(?:у\s+меня|у\s+нас)\s+(?:будет\s+)?встреч\w*\b",
+            normalized,
+        )) and not normalized.endswith("?")
+
+        # Resolve common list/edit phrases deterministically before trusting an LLM label.
+        # In particular, requests for active work must not become a fuzzy keyword search.
+        if active_query:
+            parsed["action"] = "list"
+            if re.search(r"\b(?:встреч\w*)\b", normalized):
+                parsed["kind"] = "meeting"
+            elif re.search(r"\b(?:напоминани\w*|напоминалк\w*)\b", normalized):
+                parsed["kind"] = "reminder"
+            elif re.search(r"\bзадач\w*\b", normalized):
+                parsed["kind"] = "task"
+            else:
+                parsed["kind"] = "any"
+            if period_match:
+                phrase = period_match.group(1)
+                if "послезавтра" in phrase:
+                    parsed["period"] = "day_after_tomorrow"
+                elif "завтра" in phrase:
+                    parsed["period"] = "tomorrow"
+                elif "сегодня" in phrase:
+                    parsed["period"] = "today"
+                elif "следующей неделе" in phrase:
+                    parsed["period"] = "next_week"
+                else:
+                    parsed["period"] = "week"
+            else:
+                active_date = self._extract_date_phrase(user_text)
+                written_months = "|".join(re.escape(m) for m in MONTHS_RU_PARSE)
+                active_date_pattern = r"\b(?:" + "|".join(re.escape(w) for w in WEEKDAYS) + r"|\d{1,2}[.\-/]\d{1,2}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+(?:" + written_months + r"))\b"
+                if active_date and re.search(active_date_pattern, normalized):
+                    parsed["period"] = "specific_date"
+                    parsed["date_text"] = active_date
+                else:
+                    parsed["period"] = "all"
+            parsed["title"] = ""
+        elif asks_for_period and not is_create_utterance:
+            parsed["action"] = "list"
+            period = period_match.group(1)
+            if "послезавтра" in period:
+                parsed["period"] = "day_after_tomorrow"
+            elif "завтра" in period:
+                parsed["period"] = "tomorrow"
+            elif "сегодня" in period:
+                parsed["period"] = "today"
+            elif "следующей неделе" in period:
+                parsed["period"] = "next_week"
+            else:
+                parsed["period"] = "week"
+            parsed["title"] = ""
+            parsed["date_text"] = ""
+        elif not is_create_utterance and list_lead:
+            # Queries naming a weekday or a calendar date should list exactly that day,
+            # not accidentally use an LLM-selected rolling period.
+            date_for_list = self._extract_date_phrase(user_text)
+            written_months = "|".join(re.escape(m) for m in MONTHS_RU_PARSE)
+            date_pattern = r"\b(?:" + "|".join(re.escape(w) for w in WEEKDAYS) + r"|\d{1,2}[.\-/]\d{1,2}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+(?:" + written_months + r"))\b"
+            if date_for_list and re.search(date_pattern, normalized):
+                parsed["action"] = "list"
+                parsed["period"] = "specific_date"
+                parsed["date_text"] = date_for_list
+                parsed["title"] = ""
+
+        explicit_rename = bool(re.search(
+            r"\b(?:переименуй|переименовать|измени\s+(?:название|имя)|изменить\s+(?:название|имя)|поменяй\s+(?:название|имя)|поменять\s+(?:название|имя)|замени\s+(?:название|имя))\b",
+            normalized,
+        ))
+        generic_change = bool(re.match(
+            r"^(?:пожалуйста\s+)?(?:измени|изменить|поменяй|поменять|отредактируй|редактируй|обнови|обновить)\s+",
+            normalized,
+        ))
+        has_explicit_schedule = bool(self._extract_date_phrase(user_text) or self._extract_explicit_time(user_text) is not None)
+        explicit_reschedule = bool(re.search(
+            r"\b(?:перенеси|перенести|перенос|сдвинь|сдвинуть|измени\s+(?:дату|время|срок)|изменить\s+(?:дату|время|срок)|поменяй\s+(?:дату|время|срок)|поменять\s+(?:дату|время|срок)|отложи|отложить)\b",
+            normalized,
+        ))
+        if not is_create_utterance and not natural_task_create and not natural_meeting_create:
+            if explicit_rename or (generic_change and not has_explicit_schedule and re.search(r"\b(?:на|вместо)\b", normalized)):
+                parsed["action"] = "rename"
+            elif explicit_reschedule or (generic_change and has_explicit_schedule):
+                parsed["action"] = "reschedule"
+            elif generic_change:
+                parsed["action"] = "edit_unclear"
+
+        action = parsed.get("action", "unknown")
+        kind = parsed.get("kind", "any")
+        if kind not in {"task", "reminder", "meeting", "any"}:
+            kind = "any"
+        title = str(parsed.get("title") or "").strip()
+        # Never take dates/times from the LLM on creation/edit: extract them from
+        # the user's utterance, otherwise ask a follow-up instead of using a guess.
+        source_date = self._extract_date_phrase(user_text)
+        date_text = source_date if source_date else ""
+
+        meeting_create = bool(re.match(
+            r"^(?:пожалуйста\s+)?(?:добавь|добавить|создай|создать|поставь|поставить|запланируй|запланировать|назначь|назначить)\s+(?:(?:мне|нам)\s+)?(?:новую\s+)?встреч\w*\b",
+            normalized,
+        )) or natural_meeting_create
+        if is_create_utterance or natural_task_create or natural_meeting_create:
+            action = "create"
+            if meeting_create or natural_meeting_create:
+                kind = "meeting"
+            elif re.search(r"\b(?:напомни|напомнить|напоминани\w*|напоминалк\w*)\b", normalized):
+                kind = "reminder"
+            elif re.search(r"\b(?:задач\w*|дело)\b", normalized) or natural_task_create:
+                kind = "task"
+            extracted_title = self._extract_title_from_request(user_text)
+            if extracted_title:
+                title = extracted_title
+        if action == "reschedule":
+            date_text = source_date
+        due_at = self._parse_date(date_text)
+
+        if action == "list":
+            all_requested = bool(re.search(
+                r"\b(?:все\s+(?:записи|задачи|встречи|события|напоминания)?|всё|всех\s+(?:задач|встреч|событий|напоминаний))\b",
+                normalized,
+            ))
+            if all_requested and not period_match and parsed.get("period") != "specific_date":
+                parsed["period"] = "all"
+            elif parsed.get("period") != "specific_date" and not period_match and not active_query:
+                # A model may fill `week` by default; that is not user consent to a period.
+                parsed["period"] = ""
+
+        if action == "clarify":
+            return str(parsed.get("clarification") or "Уточните, пожалуйста, дату или время.")
+        if action == "unknown":
+            return "Не понял запрос. Попробуйте: «добавь задачу…», «что у меня завтра?», «найди задачу…»"
+        if action == "create":
+            if not title:
+                return "Не удалось определить название. Что именно нужно записать?"
+            if kind == "any":
+                explicit_time_for_kind = self._extract_explicit_time(user_text)
+                self.pending_clarification = {
+                    "type": "create_kind", "kind": "any", "title": title,
+                    "date_text": date_text, "time_value": explicit_time_for_kind,
+                }
+                return "Что создать: задачу, напоминание или встречу?"
+
+            # Never invent a date or time. Every new task/reminder/meeting must
+            # have both explicitly supplied by the user before it is persisted.
+            explicit_time = self._extract_explicit_time(user_text)
+            if not date_text and source_date:
+                date_text = source_date
+            if not date_text and due_at:
+                date_text = due_at
+            parsed_day = self._parse_date(date_text) if date_text else None
+            if date_text and not parsed_day:
+                return f"Не смог надёжно разобрать дату «{date_text}». Уточните её, пожалуйста."
+            if not parsed_day:
+                pending = {"type": "create_date", "kind": kind, "title": title, "date_text": "", "time_value": explicit_time, "attempts": 0}
+                self.pending_clarification = pending
+                return self._pending_prompt(pending)
+            if not explicit_time:
+                pending = {"type": "create_time", "kind": kind, "title": title, "date_text": date_text, "attempts": 0}
+                self.pending_clarification = pending
+                return f"Дата: {self._format_date_only(parsed_day)}. " + self._pending_prompt(pending)
+            base = datetime.fromisoformat(parsed_day)
+            due_at = base.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
+            row = self.repo.create(kind, title, due_at)
+            return "Создано: " + self._format_entry(row)
+        if action == "edit_unclear":
+            row, candidates, explicit_id = self._resolve_mutation_target(user_text, title, kind)
+            if explicit_id is not None and row is None:
+                return f"Не нашёл запись с ID {explicit_id}. Ничего не изменено."
+            if row is None and len(candidates) > 1:
+                choices = "; ".join(f"{r['title']} (ID {r['id']}, {self._format_due(r['due_at'])})" for r in candidates[:5])
+                return f"Нашёл несколько похожих записей: {choices}. Уточните название или ID."
+            if row is None:
+                return "Не нашёл запись для изменения. Укажите её точное название или ID."
+            self.pending_clarification = {
+                "type": "edit_field", "entry_id": row["id"],
+                "title": row["title"], "kind": row["kind"],
+            }
+            return f"Что изменить у записи «{row['title']}»: название или срок (дату и время)?"
+        if action == "list":
+            period = parsed.get("period")
+            if not period:
+                return "За какой период показать записи: сегодня, завтра, на неделю или все записи?"
+            if period == "all":
+                rows = self.repo.all(100, include_done=not active_query)
+                if kind != "any":
+                    rows = [r for r in rows if r["kind"] == kind]
+            elif period == "specific_date":
+                date_value = self._parse_date(parsed.get("date_text", ""))
+                if not date_value:
+                    return "Какую дату проверить? Укажите её словами или в формате ДД.ММ.ГГГГ."
+                date_obj = datetime.fromisoformat(date_value).date()
+                start_dt = datetime.combine(date_obj, datetime.min.time())
+                rows = self.repo.between(start_dt.isoformat(timespec="minutes"), (start_dt + timedelta(days=1)).isoformat(timespec="minutes"), kind, include_done=not active_query)
+            else:
+                if period not in {"today", "tomorrow", "day_after_tomorrow", "week", "next_week"}:
+                    return "За какой период показать записи: сегодня, завтра, на неделю или все записи?"
+                start, end = self._period_bounds(period)
+                rows = self.repo.between(start, end, kind, include_done=not active_query)
+            if not rows:
+                return "Активных записей не найдено." if active_query else "За указанный период записей не найдено."
+            prefix = "Активные записи:\n" if active_query else "Найдено:\n"
+            return prefix + "\n".join(self._format_entry(r) for r in rows[:20])
+        if action == "search":
+            query = title or user_text
+            rows = self.repo.find(query, kind)
+            # If lexical matching is weak or empty, try local multilingual embeddings.
+            strong_lexical_match = any(
+                query.casefold().strip() in row["title"].casefold()
+                or row["title"].casefold() in query.casefold().strip()
+                for row in rows if len(query.strip()) >= 4
+            )
+            if len(rows) < 3 or not strong_lexical_match:
+                candidates = [r for r in self.repo.all(1000) if kind in {"any", r["kind"]}]
+                try:
+                    semantic_rows = self.semantic_search.rank(user_text, candidates, limit=10)
+                    known = {r["id"] for r in rows}
+                    semantic_additions = [r for r in semantic_rows if r["id"] not in known]
+                    if not strong_lexical_match:
+                        rows = semantic_additions + rows
+                    else:
+                        rows.extend(semantic_additions)
+                except Exception:
+                    # Semantic model is optional until its first successful local download.
+                    pass
+            if not rows:
+                return f"Не нашёл запись по запросу «{query}»."
+            return "Нашёл:\n" + "\n".join(self._format_entry(r) for r in rows[:10])
+        if action in {"delete", "reschedule", "complete", "rename"}:
+            row, matches, explicit_id = self._resolve_mutation_target(user_text, title, kind)
+            if explicit_id is not None and row is None:
+                return f"Не нашёл запись с ID {explicit_id}. Ничего не изменено."
+            if row is None and len(matches) > 1:
+                choices = "; ".join(f"{r['title']} (ID {r['id']}, {self._format_due(r['due_at'])})" for r in matches[:5])
+                return f"Нашёл несколько похожих записей: {choices}. Уточните название, дату или ID."
+            if row is None:
+                return "Не нашёл запись. Назовите её точнее или укажите ID."
+            if action == "rename":
+                new_title = self._extract_new_title(user_text, row)
+                if not new_title:
+                    self.pending_clarification = {
+                        "type": "rename_title", "entry_id": row["id"],
+                        "title": row["title"], "kind": row["kind"],
+                    }
+                    return f"На какое новое название изменить запись «{row['title']}»?"
+                if len(new_title) > 200:
+                    return "Новое название слишком длинное. Укажите не более 200 символов."
+                updated = self.repo.update_title(row["id"], new_title)
+                if not updated:
+                    return "Не удалось изменить название: запись не найдена."
+                return "Название изменено: " + self._format_entry(self.repo.get(row["id"]))
+            if action == "delete":
+                self.repo.delete(row["id"])
+                return f"Удалено: {KIND_RU[row['kind']]} «{row['title']}» (ID {row['id']})."
+            if action == "complete":
+                self.repo.complete(row["id"])
+                return f"Отмечено выполненным: «{row['title']}»."
+            explicit_time = self._extract_explicit_time(user_text)
+            # A time-only reschedule preserves the record's existing calendar date.
+            if not date_text and explicit_time is not None and row.get("due_at"):
+                try:
+                    existing_dt = datetime.fromisoformat(row["due_at"])
+                except (TypeError, ValueError):
+                    existing_dt = None
+                if existing_dt is not None:
+                    due_at = existing_dt.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
+                    if not self.repo.update_due(row["id"], due_at):
+                        return "Не удалось изменить срок записи."
+                    return "Перенесено: " + self._format_entry(self.repo.get(row["id"]))
+            if not date_text or due_at is None:
+                pending = {
+                    "type": "reschedule_date", "entry_id": row["id"],
+                    "title": row["title"], "kind": row["kind"],
+                    "date_text": "", "time_value": explicit_time, "attempts": 0,
+                }
+                self.pending_clarification = pending
+                return self._pending_prompt(pending)
+            if explicit_time is None:
+                pending = {
+                    "type": "reschedule_time", "entry_id": row["id"],
+                    "title": row["title"], "kind": row["kind"],
+                    "date_text": date_text, "time_value": None, "attempts": 0,
+                }
+                self.pending_clarification = pending
+                return f"Дата: {self._format_date_only(due_at)}. " + self._pending_prompt(pending)
+            parsed_day = datetime.fromisoformat(due_at)
+            due_at = parsed_day.replace(hour=explicit_time[0], minute=explicit_time[1], second=0, microsecond=0).isoformat(timespec="minutes")
+            self.repo.update_due(row["id"], due_at)
+            return "Перенесено: " + self._format_entry(self.repo.get(row["id"]))
+        return "Не удалось выполнить действие. Попробуйте сформулировать запрос иначе."
+
+===== assistant\llm.py =====
+import json
+import re
+import threading
+
+import torch
+import transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from .compat import transformers_dtype_kwargs
+from .config import LLM_MODEL
+
+SYSTEM_PROMPT = """Ты разбираешь запросы русского голосового помощника для задач, напоминаний и встреч.
+Верни ровно один JSON-объект, без Markdown.
+Поля: action=create|list|search|delete|reschedule|rename|complete|clarify|unknown;
+kind=task|reminder|meeting|any; title=название или поисковая фраза;
+date_text=дословное выражение даты/времени из запроса либо пустая строка;
+period=today|tomorrow|day_after_tomorrow|week|next_week|specific_date|all или пустая строка; target_id=целое число или null; clarification=вопрос или пустая строка.
+Правила: не выдумывай дату, название или ID. «что у меня сегодня/планы на завтра/покажи встречи» — list. Для «послезавтра» используй day_after_tomorrow; для конкретного дня недели или даты — specific_date.
+«найди/когда была задача» — search. «удали» — delete; «перенеси/измени дату» — reschedule;
+«переименуй/измени название» — rename. Активные дела/задачи — list со статусом open; не включай выполненные записи.
+«выполнено/готово» — complete. Создание — create. Не подставляй дату или время по умолчанию. Если при создании задачи, напоминания или встречи не хватает даты или точного времени — action=clarify и задай конкретный вопрос. Время суток вроде «утром», «в обед», «вечером» не является точным временем — спроси часы и минуты.
+Если непонятно — unknown. Не выполняй действия, только классифицируй запрос.
+"""
+
+DEFAULT_RESULT = {
+    "action": "unknown", "kind": "any", "title": "", "date_text": "",
+    "period": "", "target_id": None, "clarification": "",
+}
+
+
+class LocalLLM:
+    def __init__(self):
+        self._generation_lock = threading.Lock()
+        self.tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        # Transformers 4.56+ uses `dtype`; avoid the deprecated argument on current versions.
+        kwargs = transformers_dtype_kwargs(transformers.__version__, dtype)
+        if torch.cuda.is_available():
+            kwargs["device_map"] = "auto"
+        self.model = AutoModelForCausalLM.from_pretrained(LLM_MODEL, **kwargs)
+        if not torch.cuda.is_available():
+            self.model.to("cpu")
+        self.model.eval()
+        self.device = next(self.model.parameters()).device
+
+    def _generate(self, messages, max_new_tokens=180):
+        with self._generation_lock:
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self.tokenizer.eos_token_id
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            generated = output[0, inputs["input_ids"].shape[1]:]
+            return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    def suggest_parameter(self, field, title, now_iso, date_text=""):
+        """Ask the local model for an uncommitted candidate date or time.
+
+        The value is validated by AssistantEngine and is only applied after the
+        user explicitly accepts it. This method never reads or writes the database.
+        """
+        if field not in {"date", "time"}:
+            return None
+        if field == "time":
+            expected = "строгое время ЧЧ:ММ, например 15:00 или 18:30"
+            context = f"Дата записи: {date_text or 'не указана'}"
+        else:
+            expected = "дату в формате YYYY-MM-DD или одно из слов сегодня/завтра/послезавтра"
+            context = "Нужна календарная дата, не время суток"
+        messages = [
+            {"role": "system", "content": (
+                "Ты предлагаешь один осторожный вариант недостающего параметра для локального планировщика. "
+                "Ничего не создавай и не изменяй. Верни только JSON вида {\"value\":\"...\"}. "
+                f"Для поля {field} верни {expected}. Не добавляй пояснений, не выдумывай дату из прошлого."
+            )},
+            {"role": "user", "content": (
+                f"Сейчас: {now_iso}. Запись: {title}. {context}. "
+                f"Предложи удобный кандидат для поля {field}. Только JSON."
+            )},
+        ]
+        raw = self._generate(messages, max_new_tokens=64)
+        match = re.search(r"\{.*?\}", raw, re.S)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        value = data.get("value") if isinstance(data, dict) else None
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def parse(self, user_text, now_iso, records_summary=""):
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Текущая дата и время: {now_iso}\nСуществующие записи (только для понимания ссылок):\n{records_summary[:1800]}\nЗапрос: {user_text}\nВерни JSON."},
+        ]
+        try:
+            raw = self._generate(messages)
+            match = re.search(r"\{.*\}", raw, re.S)
+            if not match:
+                return dict(DEFAULT_RESULT)
+            data = json.loads(match.group(0))
+            result = dict(DEFAULT_RESULT)
+            result.update({k: data[k] for k in result.keys() if k in data})
+            if result["action"] not in {"create", "list", "search", "delete", "reschedule", "rename", "complete", "clarify", "unknown"}:
+                result["action"] = "unknown"
+            if result["kind"] not in {"task", "reminder", "meeting", "any"}:
+                result["kind"] = "any"
+            if result["target_id"] is not None:
+                try:
+                    result["target_id"] = int(result["target_id"])
+                except (TypeError, ValueError):
+                    result["target_id"] = None
+            return result
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return dict(DEFAULT_RESULT)
+
+===== assistant\semantic_search.py =====
+"""Optional local multilingual embedding search, loaded lazily on first search.
+
+If the embedding model cannot be downloaded/loaded (for example, offline on first
+run), callers can transparently fall back to the repository's lexical search.
+"""
+from __future__ import annotations
+
+import threading
+from typing import Iterable
+
+
+class SemanticSearch:
+    MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+    def __init__(self, encoder=None):
+        self._encoder = encoder
+        self._lock = threading.Lock()
+        self._load_error = None
+
+    def _load(self):
+        if self._encoder is not None:
+            return
+        with self._lock:
+            if self._encoder is not None:
+                return
+            if self._load_error is not None:
+                raise RuntimeError("Семантическая модель ранее не загрузилась") from self._load_error
+            try:
+                import torch
+                from transformers import AutoModel, AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+                model = AutoModel.from_pretrained(self.MODEL_NAME)
+                model.to("cpu")
+                model.eval()
+
+                def encode(texts):
+                    batch = tokenizer(list(texts), padding=True, truncation=True,
+                                      max_length=128, return_tensors="pt")
+                    with torch.inference_mode():
+                        output = model(**batch).last_hidden_state
+                        mask = batch["attention_mask"].unsqueeze(-1).expand(output.size()).float()
+                        pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                        pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+                    return pooled.cpu().tolist()
+
+                self._encoder = encode
+            except Exception as exc:  # network/cache/compatibility failures should not break basic search
+                self._load_error = exc
+                raise
+
+    def rank(self, query: str, rows: Iterable[dict], limit: int = 10):
+        rows = list(rows)
+        if not rows:
+            return []
+        self._load()
+        texts = [query] + [f"{row.get('kind', '')}. {row.get('title', '')}" for row in rows]
+        vectors = self._encoder(texts)
+        query_vector = vectors[0]
+        scored = []
+        for row, vector in zip(rows, vectors[1:]):
+            score = sum(a * b for a, b in zip(query_vector, vector))
+            scored.append((float(score), row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        # Avoid returning unrelated rows just because the caller asked a question.
+        return [row for score, row in scored[:limit] if score >= 0.28]
+
+===== assistant\ui.py =====
+import queue
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+from .engine import AssistantEngine
+from .llm import LocalLLM
+from .voice import Voice
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Голосовой ассистент задач")
+        self.root.geometry("820x680")
+        self.root.minsize(680, 540)
+        self.stop_event = threading.Event()
+        self.recording = False
+        self.busy = True
+        self.voice = None
+        self.engine = None
+        self._state_lock = threading.Lock()
+        self._ui_queue = queue.Queue()
+        self._closed = False
+        self.root.after(50, self._drain_ui_queue)
+
+        outer = ttk.Frame(root, padding=16)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Локальный голосовой ассистент", font=("Segoe UI", 18, "bold")).pack(pady=(0, 6))
+        ttk.Label(outer, text="Зажмите кнопку, произнесите запрос и отпустите её.").pack(pady=(0, 12))
+        self.status = tk.StringVar(value="Загружаю локальные модели. Первый запуск может занять несколько минут…")
+        ttk.Label(outer, textvariable=self.status, wraplength=760).pack(fill="x", pady=(0, 12))
+
+        self.mic = tk.Button(outer, text="ЗАЖМИТЕ И ГОВОРИТЕ", font=("Segoe UI", 14, "bold"),
+                             height=3, width=28, relief="raised", bg="#d9eaff")
+        self.mic.pack(pady=8)
+        self.mic.bind("<ButtonPress-1>", self.start_recording)
+        self.mic.bind("<ButtonRelease-1>", self.stop_recording)
+        self.mic.configure(state="disabled")
+
+        ttk.Label(outer, text="Или введите запрос текстом:").pack(anchor="w", pady=(16, 4))
+        row = ttk.Frame(outer); row.pack(fill="x")
+        self.text_input = ttk.Entry(row)
+        self.text_input.pack(side="left", fill="x", expand=True)
+        self.text_input.bind("<Return>", lambda _event: self.submit_text())
+        self.send_button = ttk.Button(row, text="Отправить", command=self.submit_text, state="disabled")
+        self.send_button.pack(side="left", padx=(8, 0))
+        ttk.Label(
+            outer,
+            text=("Подсказка: дата — «завтра» или «26.10.2026»; время — «15:30», «22 00» "
+                  "или «10 часов вечера». Напишите «предложи», чтобы получить вариант ассистента; "
+                  "«отмена» прекращает текущее уточнение."),
+            wraplength=760, foreground="#555555", justify="left",
+        ).pack(fill="x", anchor="w", pady=(5, 0))
+
+        ttk.Label(outer, text="История диалога", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(12, 4))
+        self.history = tk.Text(outer, height=16, wrap="word", state="disabled", font=("Segoe UI", 10))
+        self.history.pack(fill="both", expand=True)
+        self._append("Ассистент", "Запускаю локальные модели. Данные хранятся на этом компьютере.")
+        threading.Thread(target=self._init_models, daemon=True, name="model-loader").start()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _ui(self, fn, *args, **kwargs):
+        """Queue UI updates; only the Tk main thread touches Tk widgets."""
+        if not self._closed:
+            self._ui_queue.put((fn, args, kwargs))
+
+    def _drain_ui_queue(self):
+        if self._closed:
+            return
+        while True:
+            try:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args, **kwargs)
+            except tk.TclError:
+                # The window may have been closed while a worker was finishing.
+                continue
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except tk.TclError:
+            self._closed = True
+
+    def _init_models(self):
+        try:
+            self._ui(self._set_status, "Загружаю языковую модель Qwen2.5-1.5B-Instruct…")
+            llm = LocalLLM()
+            self._ui(self._set_status, "Загружаю распознавание речи…")
+            voice = Voice()
+            engine = AssistantEngine(llm)
+            self.llm, self.voice, self.engine = llm, voice, engine
+            self._ui(self._set_ready)
+            self._ui(self._append, "Ассистент", "Готов к работе.")
+        except Exception as exc:
+            self._ui(self._set_status, "Не удалось загрузить модели. Подробности в сообщении об ошибке.")
+            self._ui(messagebox.showerror, "Ошибка загрузки моделей", f"{type(exc).__name__}: {exc}")
+            self._ui(self._set_busy, False)
+
+    def _set_status(self, text):
+        self.status.set(text)
+
+    def _set_ready(self):
+        with self._state_lock:
+            self.busy = False
+        self.send_button.configure(state="normal")
+        self.mic.configure(state="normal")
+        self.status.set("Готово. Можно вводить следующий запрос.")
+
+    def _set_busy(self, busy):
+        with self._state_lock:
+            self.busy = busy
+        enabled = bool(self.engine) and not busy
+        self.send_button.configure(state="normal" if enabled else "disabled")
+        self.mic.configure(state="normal" if enabled else "disabled")
+
+    def _append(self, who, text):
+        self.history.configure(state="normal")
+        self.history.insert("end", f"{who}: {text}\n\n")
+        self.history.see("end")
+        self.history.configure(state="disabled")
+
+    def _acquire_busy(self):
+        with self._state_lock:
+            if self.busy:
+                return False
+            self.busy = True
+            return True
+
+    def start_recording(self, _event=None):
+        if not self.voice or not self.engine or not self._acquire_busy():
+            self.status.set("Модели загружаются или обрабатывается предыдущий запрос.")
+            return "break"
+        self.recording = True
+        self.stop_event.clear()
+        self.send_button.configure(state="disabled")
+        self.mic.configure(text="ЗАПИСЬ… ОТПУСТИТЕ ДЛЯ ОТПРАВКИ", bg="#ffcccc")
+        self.status.set("Идёт запись…")
+        threading.Thread(target=self._record_worker, daemon=True, name="audio-capture").start()
+        return "break"
+
+    def _record_worker(self):
+        try:
+            audio = self.voice.record_until_release(self.stop_event)
+            if audio is None:
+                self._ui(self._set_status, "Звук не записан. Проверьте микрофон и попробуйте снова.")
+                return
+            self._ui(self._set_status, "Распознаю речь…")
+            text = self.voice.transcribe(audio)
+            if not text:
+                self._ui(self._set_status, "Речь не распознана. Попробуйте ещё раз.")
+                return
+            self._ui(self._append, "Вы (голос)", text)
+            self._run_request(text)
+        except Exception as exc:
+            self._ui(self._append, "Ошибка микрофона", f"{type(exc).__name__}: {exc}")
+            self._ui(self._set_status, "Ошибка записи или распознавания. Можно попробовать текстовый ввод.")
+        finally:
+            self.recording = False
+            self._ui(self._request_finished)
+
+    def stop_recording(self, _event=None):
+        if self.recording:
+            self.stop_event.set()
+            self.mic.configure(text="ОБРАБОТКА…", bg="#ffe6b3")
+            self.status.set("Обрабатываю запись…")
+        return "break"
+
+    def submit_text(self):
+        text = self.text_input.get().strip()
+        if not text:
+            return
+        if not self.engine or not self._acquire_busy():
+            self.status.set("Модели загружаются или обрабатывается предыдущий запрос.")
+            return
+        self.text_input.delete(0, "end")
+        self._append("Вы (текст)", text)
+        self.send_button.configure(state="disabled")
+        self.mic.configure(state="disabled")
+        threading.Thread(target=self._run_request, args=(text,), daemon=True, name="request-worker").start()
+
+    def _run_request(self, text):
+        try:
+            self._ui(self._set_status, "Понимаю запрос и выполняю действие…")
+            result = self.engine.handle(text)
+            self._ui(self._append, "Ассистент", result)
+            self._ui(self._set_status, "Готово. Можно вводить следующий запрос.")
+            if self.voice:
+                threading.Thread(target=self.voice.speak, args=(result,), daemon=True, name="speech-output").start()
+        except Exception as exc:
+            self._ui(self._append, "Ошибка", f"{type(exc).__name__}: {exc}")
+            self._ui(self._set_status, "Ошибка при обработке запроса. Можно попробовать ещё раз.")
+        finally:
+            self._ui(self._request_finished)
+
+    def _request_finished(self):
+        with self._state_lock:
+            self.busy = False
+        self.send_button.configure(state="normal" if self.engine else "disabled")
+        self.mic.configure(state="normal" if self.engine else "disabled", text="ЗАЖМИТЕ И ГОВОРИТЕ", bg="#d9eaff")
+
+    def close(self):
+        self._closed = True
+        self.stop_event.set()
+        try:
+            if self.engine:
+                self.engine.repo.close()
+        finally:
+            self.root.destroy()
+
+
+def run_app():
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+===== assistant\voice.py =====
+import threading
+import re
+
+import numpy as np
+import sounddevice as sd
+from faster_whisper import WhisperModel
+from .config import MAX_RECORD_SECONDS, SAMPLE_RATE, STT_MODEL
+from .engine import speech_friendly_text
+
+
+class Voice:
+    def __init__(self):
+        # CPU is the reliable default. Whisper CUDA needs compatible CUDA/cuDNN runtime DLLs.
+        self.whisper = WhisperModel(STT_MODEL, device="cpu", compute_type="int8")
+        self._tts_lock = threading.Lock()
+
+    def record_until_release(self, stop_event):
+        chunks = []
+        error = []
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                # Overflow is recoverable; the audio can still be transcribed.
+                pass
+            if not stop_event.is_set():
+                chunks.append(indata.copy())
+
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
+                stop_event.wait(MAX_RECORD_SECONDS)
+        except Exception as exc:
+            error.append(exc)
+        if error:
+            raise RuntimeError(f"Не удалось открыть микрофон: {error[0]}") from error[0]
+        if not chunks:
+            return None
+        return np.concatenate(chunks, axis=0).reshape(-1)
+
+    def transcribe(self, audio):
+        if audio is None or len(audio) < SAMPLE_RATE // 3:
+            return ""
+        segments, _ = self.whisper.transcribe(
+            audio,
+            language="ru",
+            task="transcribe",
+            vad_filter=True,
+            beam_size=5,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            initial_prompt=(
+                "Русская речь о личных задачах, напоминаниях, встречах, датах и времени. "
+                "Примеры формулировок: добавить задачу, сходить в парк, позвонить Ивану, "
+                "завтра, послезавтра, в пятницу, в 15:30."
+            ),
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+    def speak(self, text):
+        # pyttsx3/Windows SAPI is COM-backed; create and use the engine in the same worker thread.
+        try:
+            import pyttsx3
+            with self._tts_lock:
+                engine = pyttsx3.init()
+                try:
+                    for voice in engine.getProperty("voices"):
+                        desc = f"{voice.name} {voice.id}".casefold()
+                        if "russian" in desc or "рус" in desc or "ru-ru" in desc:
+                            engine.setProperty("voice", voice.id)
+                            break
+                    engine.setProperty("rate", 180)
+                    engine.say(speech_friendly_text(text))
+                    engine.runAndWait()
+                finally:
+                    engine.stop()
+        except Exception:
+            # The textual answer remains available even if Windows speech is unavailable.
+            return
+
+===== assistant\__init__.py =====
+
+===== CHANGELOG.md =====
+# История изменений
+
+## 1.9.1 — 2026-10-25
+
+- Уточнения принимают естественное подтверждение предложения: «да, хорошо», «конечно», «подходит».
+- «Не надо» отменяет незавершённую операцию даже после предложения ИИ; три подряд отклонённых предложения завершают диалог без записи, чтобы не создавать бесконечный цикл.
+- Исправлено предложение времени для записи на сегодня поздно вечером: приложение больше не предлагает время, которое уже прошло.
+- Добавлены регрессионные тесты для этих сценариев. Итоговая проверка: 73 автоматических теста и компиляция пройдены.
+
+## 1.9.0 — 2026-10-25
+
+- Исправлено зацикливание уточнения времени/даты: ответы сначала проверяются как ожидаемое поле, а при нераспознанном ответе даются примеры и альтернативы, а не молча повторяется тот же запрос.
+- Расширено распознавание точного времени: `15:30`, `22:00`, `22 00`, `в 22`, `10 часов вечера`, `10 вечера`, `15 часов 30 минут`. Число внутри названия (например, «купить 5 яблок») само по себе не воспринимается как время.
+- После трёх неудачных попыток незавершённое создание/изменение отменяется; запись не создаётся и не изменяется. Явная новая команда прерывает ожидающее уточнение.
+- Добавлена команда `предложи дату/время`: локальная LLM предлагает вариант в ограниченном формате, результат проверяется кодом и применяется только после явного подтверждения «да». Если LLM недоступна или ответ не проходит проверку, предлагается явно обозначенный запасной вариант, также требующий подтверждения.
+- Добавлены короткие инструкции в UI о форматах даты/времени, предложениях и отмене. Подтверждение предложения понимает естественные ответы «да, хорошо», «конечно» и «подходит»; «не надо» отменяет операцию полностью.
+- Исправлен переход после ответа на уточнение типа «задача/напоминание/встреча»: выбранный тип больше не переинтерпретируется как дата.
+- Добавлены регрессионные тесты на разговорные ответы времени, подсказки, подтверждение/отклонение предложений, прерывание новым запросом, ограничение числа попыток и защиту от ложного времени в названии.
+- Итог для 1.9.0: 68 автоматических тестов пройдены; `compileall` прошёл.
+
+## 1.8.0 — 2026-10-25
+
+- Исправлен перенос существующей встречи/задачи, когда пользователь задаёт только новое время. Если у записи уже есть дата, она сохраняется; дата не запрашивается повторно.
+- Улучшен поиск цели изменения: учитывается полное название из запроса даже при ошибочном типе записи, возвращённом LLM.
+- При явном слове «встреча/встречу/созвон» поиск цели направляется к встречам.
+- Добавлены регрессионные тесты по отзыву тестировщика.
+
+## 1.7.0 — 2026-10-25
+
+- Исправлена команда вывода активных дел/задач; добавлено изменение названия записи; улучшена маршрутизация изменения даты/времени.
+
+## 1.6.0 — 2026-10-24
+
+- Устранено предупреждение Transformers о deprecated `torch_dtype` для актуальных версий API.
+- Исправлены кейсы дат/времени, обработка диалога и UI-потоков.
+
+## Известные незакрытые пункты
+
+- Публичный репозиторий и веб-прототип ещё не опубликованы.
+- Не реализованы планировщик уведомлений, конфликт-детектор, повторяющиеся записи, календарная интеграция и многопользовательский режим.
+- Требуется локальная end-to-end проверка настоящих моделей, микрофона и Windows TTS.
+
+===== data\assistant.sqlite3 =====
+SQLite format 3   @                                                                     .zq   = ;��=                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         W1qindexidx_entries_statusentriesCREATE INDEX idx_entries_status ON entries(status)Q+kindexidx_entries_dueentriesCREATE INDEX idx_entries_due ON entries(due_at)P++Ytablesqlite_sequencesqlite_sequenceCREATE TABLE sqlite_sequence(name,seq)�B�[tableentriesentriesCREATE TABLE entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK(kind IN ('task','reminder','meeting')),
+                    title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+                    due_at TEXT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done'))
+                )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+
+===== main.py =====
+from assistant.ui import run_app
+
+if __name__ == "__main__":
+    run_app()
+
+===== README.md =====
+# Голосовой ассистент задач, напоминаний и встреч
+
+**Версия:** 1.9.1  
+**Тип:** локальное desktop-приложение для Windows 10/11  
+**Язык интерфейса и запросов:** русский
+
+Прототип для тестового задания «Горький код». Приложение принимает голосовые и текстовые команды, разбирает их локальной языковой моделью, проверяет сведения детерминированной бизнес-логикой и хранит записи в SQLite.
+
+## Возможности
+
+- Ввод текстом или запись голоса удержанием кнопки; распознавание через `faster-whisper`.
+- Локальная LLM Qwen2.5-1.5B-Instruct классифицирует запрос и выделяет поля команды в JSON.
+- Создание задач, напоминаний и встреч; просмотр записей за указанный период или активных (незавершённых) записей; поиск старых записей; перенос срока; изменение названия; удаление; отметка выполнения.
+- Гибридный поиск: совпадение слов плюс семантическая близость на мультиязычных embeddings. Семантическая модель загружается лениво при первом поиске.
+- Уточняющий диалог: **дата и точное время не подставляются автоматически**. Если чего-то не хватает, ассистент спрашивает и не сохраняет новую запись до получения ответа. «Утром», «в обед» и «вечером» не считаются точным временем.
+- Уточнение периода просмотра, если пользователь просит показать записи, но не указал период; запросы «активные дела» выводят все незавершённые записи и не зависят от ошибочной классификации LLM.
+- Изменение записи по названию или ID: переименование, изменение даты/времени; если поле не уточнено, ассистент задаёт вопрос. Неоднозначный выбор записи требует уточнения.
+- Текстовый ответ остаётся доступным всегда; Windows TTS озвучивает ответ, если доступен.
+- SQLite сохраняет записи между запусками. Код не передаёт запросы внешнему LLM API.
+- Действия с базой выполняются отдельными короткоживущими SQLite-соединениями; виджеты Tkinter обновляются только в главном потоке.
+
+## Требования
+
+- Windows 10/11, Python 3.13 (проверка синтаксиса и тестов выполнена в Python 3.13; реальный инференс моделей следует проверить на целевом ПК).
+- Интернет нужен при первом запуске для загрузки языковой модели, Whisper и embedding-модели. После загрузки инференс локальный; семантический поиск переключается на поиск по словам, если embedding-модель недоступна.
+- Микрофон нужен только для голосового ввода; текстовый режим не зависит от микрофона.
+- Несколько гигабайт свободного дискового пространства для моделей и кэша.
+
+## Установка и запуск (PowerShell)
+
+Распакуйте архив в новую папку, например `F:\gorky_assistant_1_9_1`, затем выполните из неё:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python main.py
+```
+
+Если PowerShell блокирует активацию в текущем окне:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Первый запуск может занять несколько минут, поскольку модели скачиваются в кэш Hugging Face. Дождитесь статуса «Готов к работе». База создаётся автоматически в `data/assistant.sqlite3` рядом с `main.py`. В дистрибутиве намеренно **нет базы с тестовыми/пользовательскими данными**.
+
+## Автоматические проверки
+
+```powershell
+python -m unittest discover -s tests -v
+python -m compileall -q assistant main.py tests
+```
+
+Тесты запускаются без скачивания больших моделей: используются тестовые LLM/encoder и временная SQLite-база. Они проверяют даты и относительные интервалы, создание и уточнения без значений по умолчанию, поиск, операции с записями, работу с потоками и выбор нового аргумента Transformers `dtype`.
+
+## История изменений
+
+Подробные правки перечислены в `CHANGELOG.md`.
+
+## Исторические изменения в 1.7.0
+
+- Исправлен вывод активных дел: запросы «вывод/выведи активные дела», «покажи активные задачи» идут в режим списка и фильтруют выполненные записи. Для запросов по дате применяется фильтр периода.
+- Добавлено изменение названия записи; новое название задаётся в кавычках или словами после названия существующей записи.
+- Запросы «измени время/дату» и «перенеси» маршрутизируются в изменение срока даже при ошибочной классификации LLM.
+- Для неполной команды «измени запись» появляется уточнение: название или срок. Для неоднозначной цели ассистент просит уточнить запись и не изменяет случайную.
+- Добавлены девять регрессионных тестов для активного списка, переименования, редактирования и переноса.
+
+
+## Уточнения без зацикливания (1.9.1)
+
+- На каждый вопрос об отсутствующей дате/времени выдаются короткие примеры допустимых ответов и команды управления диалогом.
+- Время понимается в форматах `15:30`, `22:00`, `22 00`, `в 22`, `10 часов вечера`, `15 часов 30 минут`. Слова «вечером/утром/в обед» сами по себе не принимаются за точное время.
+- Если дважды не удаётся разобрать ответ, сообщение подсказывает ввести значение текстом или попросить вариант. После трёх неверных попыток незавершённое действие отменяется без сохранения или изменения записи.
+- Новая команда (`покажи активные дела`, `найди…`, `создай…`, `перенеси…`) может прервать ожидающий вопрос и начать новую операцию.
+- Для значения, которого не хватает, можно написать `предложи время` или `предложи дату`. Локальная LLM предлагает один проверяемый вариант; база не изменяется, пока пользователь явно не подтвердит его фразой `да`, `да, хорошо`, `подходит` или `конечно`. Предложение не является значением по умолчанию. Если модель не вернула корректный формат, используется явно обозначенный запасной вариант с той же обязательной процедурой подтверждения. `Нет` позволяет отказаться от предложенного варианта, а `не надо`/`отмена` полностью отменяет незавершённую операцию.
+- Ответы на уточнения обрабатываются отдельно от классификации исходного запроса: валидное время/дата изменяет состояние диалога, а не запускает новый разбор команды.
+
+## Архитектура
+
+```text
+Tkinter UI
+  ├─ текстовый запрос ──────────────────────┐
+  └─ микрофон → faster-whisper (STT) ───────┤
+                                            ↓
+                               LocalLLM (JSON intent)
+                                            ↓
+                           AssistantEngine (валидация,
+                            даты, уточняющий диалог)
+                                  ┌─────────┴─────────┐
+                                  ↓                   ↓
+                         Repository / SQLite   SemanticSearch
+                                              (Transformers +
+                                               mean pooling)
+                                  └─────────┬─────────┘
+                                            ↓
+                             текстовый ответ → Windows TTS
+```
+
+LLM не выполняет SQL и не изменяет базу напрямую. Приложение перепроверяет даты/время по исходному запросу и не принимает придуманные моделью дату или ID как надёжный факт. Удаление и изменение не выполняются по неоднозначной ссылке на запись.
+
+## Требования тестового задания: статус
+
+| Требование | Статус в этой сборке |
+|---|---|
+| Создание задач и напоминаний | Реализовано; дата и точное время обязательны, иначе идёт уточнение |
+| Создание встреч | Реализовано с уточнением недостающих даты/времени |
+| Просмотр по периоду | Реализовано для распознанных периодов и дат; без периода задаётся вопрос |
+| Поиск старых записей естественным языком | Лексический + локальный семантический поиск; качество нужно оценить на пользовательских примерах |
+| Хранение между запусками | SQLite |
+| Голосовой ввод / текстовый ответ | Реализовано; STT использует `small` на CPU по умолчанию |
+| Голосовой ответ | Windows TTS включён, если доступен; текстовый ответ сохраняется при ошибке TTS |
+| Уточняющий диалог | Реализован для типа, даты и точного времени; поддерживаются ответы на уточнение и отмена |
+| Перенос, изменение названия, удаление, отметка выполнения | Реализовано; покрыто тестами |
+| Ссылка на публичный репозиторий | **Не опубликован** — ссылка отсутствует, URL не выдумывается |
+| Ссылка на работающий публичный прототип | **Не опубликован** — сейчас приложение desktop/Tkinter, внешнего хостинга нет |
+
+Дополнительные пункты, которые остаются за пределами текущего прототипа: реальные уведомления в заданное время (записи хранятся, но планировщик уведомлений не реализован), обнаружение конфликтов встреч, повторяющиеся события, календарная интеграция и многопользовательский режим. Публичный прототип потребует отдельной web-обёртки/веб-версии и развёртывания; локальное desktop-приложение нельзя честно представить публичным URL.
+
+## Совместимость и предупреждение `torch_dtype`
+
+`assistant/compat.py` выбирает `dtype` для Transformers `>=4.56.0` и оставляет `torch_dtype` только для старых версий, где ещё требуется старый API. В поддерживаемом диапазоне зависимостей ожидается актуальный Transformers, поэтому предупреждение о deprecated `torch_dtype` не должно возникать.
+
+Ссылки на документацию, проверенные 25 октября 2026 года:
+
+- PyTorch для Windows и Python: https://pytorch.org/get-started/locally/
+- Transformers API модели и `dtype`: https://huggingface.co/docs/transformers/v4.56.1/en/main_classes/model
+- Transformers на PyPI: https://pypi.org/project/transformers/
+- faster-whisper: https://pypi.org/project/faster-whisper/
+
+## Известные ограничения
+
+- Автоматические тесты не подменяют проверку инференса Qwen/Whisper, настоящего микрофона, Windows SAPI/TTS и GPU на целевом компьютере.
+- Whisper использует CPU/int8 как наиболее предсказуемую конфигурацию Windows. GPU-ускорение Whisper не включено автоматически.
+- Семантический поиск использует encoder из Transformers и простое mean pooling с attention mask. Он не гарантирует правильное ранжирование каждого запроса; если модель не скачалась, приложение использует поиск по словам.
+- Поддержка естественных дат ограничена формулировками, перечисленными в тестах; неразрешённая неоднозначность должна уточняться.
+
+## Безопасность и данные
+
+Все задачи хранятся в локальной SQLite-базе. Репозиторий не отправляет содержимое базы в облачный API. Загрузка моделей из Hugging Face при первом запуске требует интернета. Не помещайте пароли, токены API или личные секреты в названия задач. Для публикации репозитория проверяйте, что в нём нет файла `data/assistant.sqlite3`, `.venv` или кэшей моделей.
+
+===== requirements-dev.txt =====
+-r requirements.txt
+
+===== requirements.txt =====
+# Python 3.13-compatible dependency ranges; avoid deprecated Transformers APIs.
+torch>=2.6,<3
+transformers>=4.56,<6
+accelerate>=1.2,<2
+faster-whisper>=1.1,<2
+sounddevice>=0.5,<1
+numpy>=1.26,<3
+pyttsx3>=2.98,<3
+packaging>=24,<28
+
+===== start_assistant.bat =====
+@echo off
+:: Включаем поддержку UTF-8 для корректного отображения кириллицы в консоли Windows
+chcp 65001 >nul
+setlocal
+
+echo ==========================================================
+echo        ГОЛОСОВОЙ АССИСТЕНТ (Release 1.9.1)
+echo ==========================================================
+echo.
+
+:: Проверка: существует ли уже виртуальное окружение?
+if exist ".venv\Scripts\activate.bat" (
+    echo [INFO] Виртуальное окружение (.venv) найдено.
+    echo [INFO] Активация и пропуск установки...
+    call .venv\Scripts\activate.bat
+    goto :RUN_APP
+)
+
+echo [INFO] Виртуальное окружение не найдено. Запускается первичная установка...
+echo.
+
+:: Шаг 1: Создание виртуального окружения
+echo [ШАГ 1/4] Создание .venv с использованием Python 3.13...
+py -3.13 -m venv .venv
+if errorlevel 1 (
+    echo [ОШИБКА] Не удалось создать .venv. Убедись, что Python 3.13 установлен и доступен через Python Launcher (py).
+    pause
+    exit /b 1
+)
+
+:: Шаг 2: Активация окружения для текущей сессии cmd
+call .venv\Scripts\activate.bat
+
+:: Шаг 3: Обновление pip и установка зависимостей
+echo [ШАГ 2/4] Обновление pip...
+python -m pip install --upgrade pip
+
+echo [ШАГ 3/4] Установка зависимостей из requirements.txt...
+pip install -r requirements.txt
+if errorlevel 1 (
+    echo [ОШИБКА] Ошибка при установке библиотек. Проверь интернет-соединение.
+    pause
+    exit /b 1
+)
+
+:: Шаг 4: Запуск тестов (только при первой установке)
+echo [ШАГ 4/4] Запуск автоматических тестов...
+python -m unittest discover -s tests -v
+echo.
+echo [INFO] Установка и тесты завершены успешно!
+echo.
+
+:RUN_APP
+echo ==========================================================
+echo  Запуск ассистента (main.py)...
+echo  Дождитесь статуса "Готово" (идет загрузка локальных моделей)
+echo ==========================================================
+echo.
+
+:: Запуск главного скрипта
+python main.py
+
+:: Деактивация окружения при закрытии программы (чистота сессии)
+call deactivate
+endlocal
+echo.
+echo Ассистент завершил работу.
+pause
+
+===== tests\test_core.py =====
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+
+from assistant.database import Repository
+from assistant.engine import AssistantEngine
+from assistant.engine import speech_friendly_text
+from assistant.semantic_search import SemanticSearch
+from assistant.compat import transformers_dtype_kwargs
+
+
+class FakeLLM:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def parse(self, user_text, now_iso, records_summary=""):
+        if not self.responses:
+            raise AssertionError("Unexpected extra LLM parse call")
+        return self.responses.pop(0)
+
+
+class CoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Repository(Path(self.tmp.name) / "test.sqlite3")
+        self.fixed_now = datetime(2026, 10, 20, 13, 0)
+
+    def tearDown(self):
+        self.repo.close()
+        self.tmp.cleanup()
+
+    def engine(self, responses):
+        return AssistantEngine(FakeLLM(responses), self.repo, clock=lambda: self.fixed_now)
+
+    def test_create_and_persist_across_repository_instances(self):
+        row = self.repo.create("task", "Сдать доклад", "2026-10-21T09:00")
+        self.assertEqual(row["title"], "Сдать доклад")
+        second_repo = Repository(self.repo.db_path)
+        self.assertEqual(second_repo.get(row["id"])["title"], "Сдать доклад")
+
+    def test_create_request_parses_tomorrow(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сдать доклад", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу на завтра в 10:00: сдать доклад")
+        self.assertIn("Создано", result)
+        row = self.repo.all()[0]
+        self.assertEqual(row["due_at"], "2026-10-21T10:00")
+
+    def test_list_and_search(self):
+        self.repo.create("task", "Подготовить презентацию", "2026-10-21T10:00")
+        list_engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "tomorrow", "target_id": None, "clarification": ""}])
+        self.assertIn("презентацию", list_engine.handle("Что у меня завтра?"))
+        search_engine = self.engine([{"action": "search", "kind": "any", "title": "презентация", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        self.assertIn("Подготовить презентацию", search_engine.handle("Найди презентацию"))
+
+    def test_complete_and_delete(self):
+        row = self.repo.create("task", "Позвонить Ивану")
+        engine = self.engine([{"action": "complete", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": row["id"], "clarification": ""}])
+        self.assertIn("выполненным", engine.handle("Отметь выполненной задачу позвонить Ивану"))
+        self.assertEqual(self.repo.get(row["id"])["status"], "done")
+        delete_engine = self.engine([{"action": "delete", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": row["id"], "clarification": ""}])
+        self.assertIn("Удалено", delete_engine.handle("Удали задачу"))
+        self.assertIsNone(self.repo.get(row["id"]))
+
+    def test_relative_date_parsing(self):
+        engine = self.engine([])
+        self.assertEqual(engine._parse_date("послезавтра в 15:30"), "2026-10-22T15:30")
+        self.assertEqual(engine._parse_date("через 2 часа"), "2026-10-20T15:00")
+        self.assertEqual(engine._parse_date("25.10.2026 в 14:00"), "2026-10-25T14:00")
+
+    def test_iso_datetime_returned_by_llm_is_accepted(self):
+        engine = self.engine([])
+        self.assertEqual(engine._parse_date("2026-10-21T13:57"), "2026-10-21T13:57")
+        self.assertEqual(engine._parse_date("2026-10-21"), "2026-10-21T00:00")
+
+    def test_create_accepts_iso_datetime_from_llm(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Проверить расписание", "date_text": "2026-10-21T13:57", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T10:00")
+
+    def test_create_relative_date_overrides_stale_llm_date(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "задача на завтра - сходить в парк", "date_text": "2026-10-19T00:00", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Создать задачу на завтра в 10:00 сходить в парк")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["title"], "Сходить в парк")
+        self.assertEqual(row["due_at"], "2026-10-21T10:00")
+
+    def test_create_title_removes_command_and_date_phrase(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "задачу на завтра проверить расписание", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
+        self.assertEqual(self.repo.all()[0]["title"], "Проверить расписание")
+
+    def test_bare_tasks_for_tomorrow_is_list(self):
+        self.repo.create("task", "Сходить в парк", "2026-10-21T09:00")
+        engine = self.engine([{"action": "search", "kind": "any", "title": "задачи на завтра", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("задачи на завтра")
+        self.assertIn("Сходить в парк", result)
+
+    def test_create_uses_date_from_original_text_when_llm_omits_it(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Проверить расписание", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
+        self.assertIn("Создано", result)
+        row = self.repo.all()[0]
+        self.assertEqual(row["due_at"], "2026-10-21T10:00")
+
+    def test_tomorrow_question_is_list_even_if_llm_says_search(self):
+        self.repo.create("task", "Проверить расписание", "2026-10-21T09:00")
+        engine = self.engine([{"action": "search", "kind": "any", "title": "Какая задача на завтра?", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("Какая задача на завтра?")
+        self.assertIn("Проверить расписание", result)
+        self.assertNotIn("Не нашёл запись", result)
+
+    def test_two_requests_in_sequence(self):
+        engine = self.engine([
+            {"action": "create", "kind": "task", "title": "Проверить расписание", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""},
+            {"action": "search", "kind": "any", "title": "расписание", "date_text": "", "period": "all", "target_id": None, "clarification": ""},
+        ])
+        first = engine.handle("Добавь задачу на завтра в 10:00: проверить расписание")
+        second = engine.handle("Найди задачу про расписание")
+        self.assertIn("Создано", first)
+        self.assertIn("проверить расписание", second.casefold())
+
+    def test_reschedule(self):
+        row = self.repo.create("meeting", "Встреча с командой", "2026-10-21T15:00")
+        engine = self.engine([{"action": "reschedule", "kind": "meeting", "title": "Встреча с командой", "date_text": "пятницу в 14:00", "period": "all", "target_id": row["id"], "clarification": ""}])
+        result = engine.handle("Перенеси встречу на пятницу в 14:00")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-23T14:00")
+
+    def test_display_date_is_russian_and_human_readable(self):
+        engine = self.engine([])
+        self.assertEqual(engine._format_due("2026-10-23T00:00"), "23 октября 2026 года, 00:00")
+
+    def test_spoken_text_does_not_read_database_hash_id(self):
+        spoken = speech_friendly_text("Создано: #5 задача: «Сходить в парк», срок: 2026-10-23T09:00, статус: активна")
+        self.assertNotIn("#", spoken)
+        self.assertIn("задача", spoken)
+        self.assertIn("Сходить в парк", spoken)
+
+
+    def test_vague_daypart_asks_for_exact_time(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Погулять на речке", "date_text": "сегодня", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу сегодня в обед: погулять на речке")
+        self.assertIn("точное время", result)
+        self.assertEqual(self.repo.all(), [])
+        result = engine.handle("13:00")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-20T13:00")
+
+    def test_create_on_15_hours_today_keeps_time_and_cleans_title(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "На 15 часов, сходите на работу", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу на 15 часов, на сегодня сходите на работу")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["title"], "Сходите на работу")
+        self.assertEqual(row["due_at"], "2026-10-20T15:00")
+
+    def test_parse_dayparts(self):
+        engine = self.engine([])
+        self.assertEqual(engine._parse_date("сегодня в обед"), "2026-10-20T00:00")
+        self.assertEqual(engine._parse_date("завтра вечером"), "2026-10-21T00:00")
+        self.assertEqual(engine._parse_date("сегодня в 15:00"), "2026-10-20T15:00")
+
+    def test_empty_title_rejected(self):
+        with self.assertRaises(ValueError):
+            self.repo.create("task", "   ")
+
+    def test_llm_clarify_classification_still_starts_meeting_dialog(self):
+        engine = self.engine([{"action": "clarify", "kind": "meeting", "title": "Встреча с Иваном", "date_text": "завтра", "period": "week", "target_id": None, "clarification": "Уточните время"}])
+        first = engine.handle("Добавь встречу с Иваном завтра")
+        self.assertIn("точное время", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("в 15:00")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
+
+    def test_meeting_missing_time_starts_active_clarification(self):
+        engine = self.engine([{"action": "create", "kind": "meeting", "title": "Встреча с Иваном", "date_text": "завтра", "period": "week", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь встречу с Иваном завтра")
+        self.assertIn("точное время", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("в 15:00")
+        self.assertIn("Создано", second)
+        row = self.repo.all()[0]
+        self.assertEqual(row["title"], "Встреча с Иваном")
+        self.assertEqual(row["due_at"], "2026-10-21T15:00")
+
+    def test_meeting_clarification_can_supply_date_and_time(self):
+        engine = self.engine([{"action": "create", "kind": "meeting", "title": "Дизайнер", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь встречу с дизайнером")
+        self.assertIn("На какую дату", first)
+        second = engine.handle("в пятницу в 11:30")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-23T11:30")
+
+    def test_semantic_search_cosine_ranking_with_injected_encoder(self):
+        # Query is close to the first row; the second row is orthogonal.
+        vectors = {
+            "когда обсуждали дизайн": [1.0, 0.0],
+            "meeting. Обсудить макет": [0.9, 0.1],
+            "task. Купить молоко": [0.0, 1.0],
+        }
+        search = SemanticSearch(encoder=lambda texts: [vectors[text] for text in texts])
+        rows = [
+            {"id": 1, "kind": "meeting", "title": "Обсудить макет"},
+            {"id": 2, "kind": "task", "title": "Купить молоко"},
+        ]
+        result = search.rank("когда обсуждали дизайн", rows)
+        self.assertEqual([row["id"] for row in result], [1])
+
+    def test_semantic_search_results_are_added_to_lexical_search(self):
+        row = self.repo.create("meeting", "Обсудить макет с Иваном", "2026-10-21T15:00")
+        class FakeSemantic:
+            def rank(self, query, rows, limit=10):
+                self.assertion = query
+                return [r for r in rows if r["id"] == row["id"]]
+        semantic = FakeSemantic()
+        engine = AssistantEngine(FakeLLM([{"action": "search", "kind": "any", "title": "дизайн", "date_text": "", "period": "all", "target_id": None, "clarification": ""}]), self.repo, clock=lambda: self.fixed_now, semantic_search=semantic)
+        result = engine.handle("Когда мы обсуждали дизайн с Иваном?")
+        self.assertIn("Обсудить макет с Иваном", result)
+        self.assertEqual(semantic.assertion, "Когда мы обсуждали дизайн с Иваном?")
+
+    def test_sequential_cross_thread_db_access(self):
+        import threading
+        errors = []
+        def worker(i):
+            try:
+                self.repo.create("task", f"task-{i}")
+                self.repo.all(10)
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(12)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.repo.all(100)), 12)
+
+
+    def test_task_without_time_asks_and_does_not_create_until_answer(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу на завтра сходить в парк")
+        self.assertIn("точное время", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("в 15:30")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["title"], "Сходить в парк")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:30")
+
+    def test_task_without_date_asks_for_date_and_then_time(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить хлеб", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу купить хлеб в 16:00")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("завтра")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:00")
+
+    def test_vague_daypart_is_not_silently_converted_to_time(self):
+        engine = self.engine([])
+        self.assertEqual(engine._extract_explicit_time("завтра вечером"), None)
+        self.assertEqual(engine._extract_date_phrase("завтра вечером"), "завтра")
+
+    def test_list_without_period_asks_instead_of_defaulting_to_week(self):
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи мои записи")
+        self.assertIn("За какой период", result)
+
+
+    def test_task_without_date_or_time_collects_both_before_saving(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу позвонить Ивану")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("послезавтра")
+        self.assertIn("точное время", second)
+        self.assertEqual(self.repo.all(), [])
+        third = engine.handle("в 14:20")
+        self.assertIn("Создано", third)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-22T14:20")
+
+
+    def test_transformers_dtype_uses_non_deprecated_argument(self):
+        self.assertEqual(transformers_dtype_kwargs("4.56.0", "fp16"), {"dtype": "fp16"})
+        self.assertEqual(transformers_dtype_kwargs("5.20.2", "fp16"), {"dtype": "fp16"})
+        self.assertEqual(transformers_dtype_kwargs("4.55.4", "fp16"), {"torch_dtype": "fp16"})
+
+    def test_day_after_tomorrow_list_is_not_tomorrow(self):
+        self.repo.create("task", "Завтрашнее дело", "2026-10-21T10:00")
+        self.repo.create("task", "Дело послезавтра", "2026-10-22T10:00")
+        engine = self.engine([{"action": "search", "kind": "any", "title": "задачи на послезавтра", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("Какие задачи на послезавтра?")
+        self.assertIn("Дело послезавтра", result)
+        self.assertNotIn("Завтрашнее дело", result)
+
+    def test_creation_does_not_accept_date_hallucinated_by_llm(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить молоко", "date_text": "2026-10-19T09:00", "period": "all", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу купить молоко")
+        self.assertIn("На какую дату", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("завтра")
+        self.assertIn("точное время", second)
+        self.assertEqual(self.repo.all(), [])
+        third = engine.handle("15:30")
+        self.assertIn("Создано", third)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:30")
+
+    def test_relative_two_hours_written_in_words(self):
+        engine = self.engine([{"action": "clarify", "kind": "task", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": "уточните"}])
+        result = engine.handle("Добавь задачу через два часа позвонить Ивану")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["title"], "Позвонить Ивану")
+        self.assertEqual(row["due_at"], "2026-10-20T15:00")
+
+    def test_relative_thirty_minutes_is_exact_deadline(self):
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Добавь задачу через 30 минут позвонить Ивану")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["due_at"], "2026-10-20T13:30")
+
+    def test_natural_language_meeting_example_from_spec(self):
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("В четверг в 11 у меня встреча с дизайнером")
+        row = self.repo.all()[0]
+        self.assertIn("Создано", result)
+        self.assertEqual(row["kind"], "meeting")
+        self.assertEqual(row["title"], "Встреча с дизайнером")
+        self.assertEqual(row["due_at"], "2026-10-22T11:00")
+
+    def test_natural_language_task_example_from_spec_asks_for_time(self):
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("В пятницу нужно отправить отчет")
+        self.assertIn("точное время", result)
+        self.assertEqual(self.repo.all(), [])
+        result = engine.handle("в 14:00")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["title"], "Отправить отчет")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-23T14:00")
+
+    def test_deadline_before_end_of_week_is_not_lost_from_title(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить билеты", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Поставь задачу купить билеты до конца недели")
+        self.assertIn("точное время", result)
+        self.assertEqual(self.repo.all(), [])
+        result = engine.handle("17:00")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["title"], "Купить билеты")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-25T17:00")
+
+
+    def test_relative_two_days_is_not_mistaken_for_14_oclock(self):
+        engine = self.engine([])
+        self.assertIsNone(engine._extract_explicit_time("через 2 дня позвонить Ивану"))
+        self.assertEqual(engine._extract_explicit_time("через 2 дня в 15:30 позвонить Ивану"), (15, 30))
+        self.assertEqual(engine._parse_date("через 2 дня в 15:30"), "2026-10-22T15:30")
+
+    def test_weekday_list_query_returns_only_requested_day(self):
+        self.repo.create("task", "Понедельничное дело", "2026-10-26T10:00")
+        self.repo.create("task", "Пятничное дело", "2026-10-23T10:00")
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Какие задачи в пятницу?")
+        self.assertIn("Пятничное дело", result)
+        self.assertNotIn("Понедельничное дело", result)
+
+
+    def test_list_does_not_accept_llm_default_week_when_user_omits_period(self):
+        self.repo.create("task", "Запланированное дело", "2026-10-21T10:00")
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи мои записи")
+        self.assertIn("За какой период", result)
+
+    def test_reschedule_without_time_asks_and_does_not_save_midnight(self):
+        row = self.repo.create("meeting", "Встреча с командой", "2026-10-21T15:00")
+        engine = self.engine([{"action": "reschedule", "kind": "meeting", "title": "Встреча с командой", "date_text": "пятницу", "period": "all", "target_id": row["id"], "clarification": ""}])
+        first = engine.handle("Перенеси встречу с командой на пятницу")
+        self.assertIn("точное время", first)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T15:00")
+        second = engine.handle("в 14:00")
+        self.assertIn("Перенесено", second)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-23T14:00")
+
+    def test_reschedule_with_time_but_no_date_preserves_existing_date(self):
+        row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T15:00")
+        engine = self.engine([{"action": "reschedule", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": row["id"], "clarification": ""}])
+        first = engine.handle("Перенеси задачу позвонить Ивану на 16:30")
+        self.assertIn("Перенесено", first)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+    def test_tester_case_meeting_title_variant_and_wrong_kind(self):
+        row = self.repo.create("meeting", "Встретить Стаса", "2026-10-26T20:00")
+        # A similarly worded task should not win just because the LLM says kind=task.
+        self.repo.create("task", "Подготовить встречу с заказчиком", "2026-10-27T12:00")
+        # Simulate the LLM returning both a grammatical title variant and wrong kind.
+        engine = self.engine([{"action": "reschedule", "kind": "task", "title": "встречу Стаса", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("перенеси встречу Стаса на 10 часов вечера")
+        self.assertIn("Перенесено", result)
+        self.assertNotIn("На какую дату", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-26T22:00")
+
+    def test_reschedule_full_title_works_even_if_user_calls_meeting_a_task(self):
+        row = self.repo.create("meeting", "Встретить Стаса", "2026-10-26T20:00")
+        engine = self.engine([{"action": "reschedule", "kind": "task", "title": "Встретить Стаса", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("перенеси задачу Встретить Стаса на 10 часов вечера")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-26T22:00")
+
+    def test_time_answer_during_reschedule_clarification_does_not_repeat_date_question(self):
+        row = self.repo.create("meeting", "Встретить Стаса", "2026-10-26T20:00")
+        engine = self.engine([])
+        engine.pending_clarification = {
+            "type": "reschedule_date", "entry_id": row["id"], "title": row["title"],
+            "kind": "meeting", "date_text": "", "time_value": None,
+        }
+        result = engine.handle("22:00")
+        self.assertIn("Перенесено", result)
+        self.assertNotIn("На какую дату", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-26T22:00")
+
+
+    def test_ambiguous_creation_type_is_asked_not_defaulted_to_task(self):
+        engine = self.engine([{"action": "create", "kind": "any", "title": "Купить молоко", "date_text": "завтра в 15:00", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Создай купить молоко завтра в 15:00")
+        self.assertIn("задачу, напоминание или встречу", first)
+        self.assertEqual(self.repo.all(), [])
+        second = engine.handle("напоминание")
+        self.assertIn("Создано", second)
+        self.assertEqual(self.repo.all()[0]["kind"], "reminder")
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
+
+    def test_invalid_explicit_id_never_falls_back_to_another_row(self):
+        self.repo.create("task", "Позвонить Ивану", "2026-10-21T15:00")
+        engine = self.engine([{"action": "delete", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "all", "target_id": 1, "clarification": ""}])
+        result = engine.handle("Удали задачу #999")
+        self.assertIn("ID 999", result)
+        self.assertEqual(len(self.repo.all()), 1)
+
+
+    def test_all_tasks_request_keeps_explicit_tomorrow_period(self):
+        self.repo.create("task", "Дело завтра", "2026-10-21T10:00")
+        self.repo.create("task", "Дело через неделю", "2026-10-27T10:00")
+        engine = self.engine([{"action": "list", "kind": "any", "title": "", "date_text": "", "period": "all", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи все задачи на завтра")
+        self.assertIn("Дело завтра", result)
+        self.assertNotIn("Дело через неделю", result)
+
+    def test_clarification_can_be_cancelled_without_creating(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в магазин", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в магазин")
+        result = engine.handle("отмена")
+        self.assertIn("отменено", result.casefold())
+        self.assertEqual(self.repo.all(), [])
+
+    def test_active_work_list_is_forced_to_list_even_if_llm_says_search(self):
+        active = self.repo.create("task", "Подготовить отчёт", "2026-10-21T10:00")
+        done = self.repo.create("task", "Сдать старый отчёт", "2026-10-20T09:00")
+        self.repo.complete(done["id"])
+        engine = self.engine([{"action": "search", "kind": "task", "title": "активные дела", "date_text": "", "period": "week", "target_id": None, "clarification": ""}])
+        result = engine.handle("Выведи активные дела")
+        self.assertIn("Активные записи", result)
+        self.assertIn("Подготовить отчёт", result)
+        self.assertNotIn("Сдать старый отчёт", result)
+
+    def test_active_list_can_filter_to_a_specific_period(self):
+        self.repo.create("task", "Активная задача завтра", "2026-10-21T10:00")
+        self.repo.create("task", "Активная задача через день", "2026-10-22T10:00")
+        engine = self.engine([{"action": "unknown", "kind": "any", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Покажи активные задачи на завтра")
+        self.assertIn("Активная задача завтра", result)
+        self.assertNotIn("Активная задача через день", result)
+
+    def test_rename_entry_by_quoted_old_and_new_titles(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Сходить в парк", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Переименуй задачу «Сходить в парк» в «Погулять в парке»")
+        updated = self.repo.get(row["id"])
+        self.assertIn("Название изменено", result)
+        self.assertEqual(updated["title"], "Погулять в парке")
+        self.assertEqual(updated["due_at"], "2026-10-21T15:30")
+
+    def test_rename_entry_with_unquoted_new_title(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Сходить в парк", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Измени название задачи «Сходить в парк» на Погулять в парке")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Погулять в парке")
+
+    def test_rename_entry_by_id(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle(f"Переименуй задачу #{row['id']} в «Погулять в парке»")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Погулять в парке")
+
+    def test_change_time_phrase_routes_to_reschedule(self):
+        row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T10:00")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Измени время задачи «Позвонить Ивану» на завтра в 16:30")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+    def test_rename_entry_without_new_title_asks_and_waits(self):
+        row = self.repo.create("task", "Сходить в парк", "2026-10-21T15:30")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Сходить в парк", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Переименуй задачу «Сходить в парк»")
+        self.assertIn("На какое новое название", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Сходить в парк")
+        result = engine.handle("Прогуляться в парке")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Прогуляться в парке")
+
+    def test_unambiguous_reschedule_works_even_when_llm_misclassifies_search(self):
+        row = self.repo.create("task", "Позвонить Ивану", "2026-10-21T10:00")
+        engine = self.engine([{"action": "search", "kind": "task", "title": "Позвонить Ивану", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Перенеси задачу «Позвонить Ивану» на завтра в 16:30")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T16:30")
+
+    def test_generic_edit_asks_what_to_change_instead_of_failing(self):
+        row = self.repo.create("task", "Купить молоко", "2026-10-21T10:00")
+        engine = self.engine([{"action": "unknown", "kind": "task", "title": "Купить молоко", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        result = engine.handle("Измени задачу «Купить молоко»")
+        self.assertIn("Что изменить", result)
+        result = engine.handle("название")
+        self.assertIn("Какое новое название", result)
+        result = engine.handle("Купить хлеб")
+        self.assertIn("Название изменено", result)
+        self.assertEqual(self.repo.get(row["id"])["title"], "Купить хлеб")
+
+    def test_time_parser_accepts_common_clarification_answers(self):
+        engine = self.engine([])
+        cases = {
+            "15:30": (15, 30),
+            "22:00": (22, 0),
+            "22 00": (22, 0),
+            "10 часов вечера": (22, 0),
+            "10 вечера": (22, 0),
+            "в 15 часов 30 минут": (15, 30),
+            "в 22": (22, 0),
+        }
+        for utterance, expected in cases.items():
+            with self.subTest(utterance=utterance):
+                self.assertEqual(engine._extract_explicit_time(utterance), expected)
+        self.assertIsNone(engine._extract_explicit_time("вечером"))
+        self.assertIsNone(engine._extract_explicit_time("я не знаю"))
+        self.assertIsNone(engine._extract_explicit_time("Купить 5 яблок"))
+
+    def test_invalid_time_answer_has_examples_and_stops_after_three_failures(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу на завтра сходить в парк")
+        self.assertIn("15:30", first)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Не распознал время", engine.handle("не знаю"))
+        self.assertIn("10 часов вечера", engine.handle("как-нибудь вечером"))
+        third = engine.handle("вчера вечером")
+        self.assertIn("за три попытки", third)
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_new_command_interrupts_pending_time_question(self):
+        self.repo.create("task", "Активная задача", "2026-10-21T10:00")
+        engine = self.engine([
+            {"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""},
+            {"action": "search", "kind": "task", "title": "Активная задача", "date_text": "", "period": "all", "target_id": None, "clarification": ""},
+        ])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        result = engine.handle("Покажи активные дела")
+        self.assertIn("Предыдущее уточнение отменено", result)
+        self.assertIn("Активная задача", result)
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(len(self.repo.all()), 1)
+
+    def test_user_can_request_and_confirm_a_time_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу на завтра сходить в парк")
+        self.assertIn("предложи время", first)
+        proposal = engine.handle("предложи время")
+        self.assertIn("Предлагаю время: 15:00", proposal)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("да"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T15:00")
+
+    def test_model_proposal_is_validated_and_not_saved_without_confirmation(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить хлеб", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра купить хлеб")
+        engine.llm.suggest_parameter = lambda **kwargs: "16:15"
+        proposal = engine.handle("предложи время")
+        self.assertIn("16:15", proposal)
+        self.assertIn("локальная модель предлагает", proposal)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("да"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:15")
+
+    def test_user_can_request_and_confirm_a_date_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Купить хлеб", "date_text": "", "period": "", "target_id": None, "clarification": ""}])
+        first = engine.handle("Добавь задачу купить хлеб в 16:00")
+        self.assertIn("На какую дату", first)
+        proposal = engine.handle("предложи дату")
+        self.assertIn("Предлагаю дату: 21 октября 2026 года", proposal)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("да"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:00")
+
+    def test_user_can_reject_suggestion_and_enter_own_time(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.handle("предложи время")
+        rejected = engine.handle("нет")
+        self.assertIn("этот вариант не использую", rejected)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIn("Создано", engine.handle("10 часов вечера"))
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T22:00")
+
+    def test_time_clarification_reschedule_accepts_spoken_hour_format(self):
+        row = self.repo.create("meeting", "Встреча со Стасом", "2026-10-26T20:00")
+        engine = self.engine([{"action": "reschedule", "kind": "meeting", "title": "Встреча со Стасом", "date_text": "завтра", "period": "", "target_id": row["id"], "clarification": ""}])
+        first = engine.handle("Перенеси встречу «Встреча со Стасом» на завтра")
+        self.assertIn("точное время", first)
+        result = engine.handle("10 часов вечера")
+        self.assertIn("Перенесено", result)
+        self.assertEqual(self.repo.get(row["id"])["due_at"], "2026-10-21T22:00")
+
+    def test_ai_proposal_accepts_natural_confirmation(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.llm.suggest_parameter = lambda **kwargs: "16:15"
+        engine.handle("предложи время")
+        result = engine.handle("Да, хорошо")
+        self.assertIn("Создано", result)
+        self.assertEqual(self.repo.all()[0]["due_at"], "2026-10-21T16:15")
+
+    def test_not_need_cancels_pending_operation_even_after_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.handle("предложи время")
+        result = engine.handle("не надо")
+        self.assertIn("создание записи отменено", result.casefold())
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_declining_three_ai_suggestions_does_not_loop_forever(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        for attempt in range(3):
+            proposal = engine.handle("предложи время")
+            self.assertIn("Предлагаю время", proposal)
+            if attempt < 2:
+                response = engine.handle("нет")
+                self.assertIn("этот вариант не использую", response)
+        result = engine.handle("нет")
+        self.assertIn("Три предложенных варианта отклонены", result)
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_combined_no_and_cancel_phrase_cancels_pending_suggestion(self):
+        engine = self.engine([{"action": "create", "kind": "task", "title": "Сходить в парк", "date_text": "завтра", "period": "", "target_id": None, "clarification": ""}])
+        engine.handle("Добавь задачу на завтра сходить в парк")
+        engine.handle("предложи время")
+        result = engine.handle("нет, не надо")
+        self.assertIn("создание записи отменено", result.casefold())
+        self.assertIsNone(engine.pending_clarification)
+        self.assertEqual(self.repo.all(), [])
+
+    def test_time_suggestion_never_falls_back_to_past_time_today(self):
+        late_now = datetime(2026, 10, 20, 23, 30)
+        engine = AssistantEngine(FakeLLM([{"action": "create", "kind": "task", "title": "Проверить дверь", "date_text": "сегодня", "period": "", "target_id": None, "clarification": ""}]), self.repo, clock=lambda: late_now)
+        engine.handle("Добавь задачу сегодня проверить дверь")
+        result = engine.handle("предложи время")
+        self.assertIn("уже нет будущего полного часа", result)
+        self.assertEqual(self.repo.all(), [])
+        self.assertIsNotNone(engine.pending_clarification)
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== TEST_REPORT.md =====
+# Отчёт о проверке — Release 1.9.1
+
+Дата подготовки: 2026-10-25.
+
+## Выполненные проверки
+
+- `python -m unittest discover -s tests -v`: **73 теста пройдены, 0 ошибок**.
+- `python -m compileall -q assistant main.py tests`: проверка синтаксической компиляции прошла.
+- Протестированы ответы времени `15:30`, `22:00`, `22 00`, `в 22`, `10 часов вечера`, `10 вечера`, `15 часов 30 минут`.
+- Проверено, что «вечером» не считается точным временем, а число в названии «купить 5 яблок» не ошибочно становится временем.
+- Проверены незавершённые уточнения: понятные подсказки на ошибочный ввод, прерывание новым запросом, завершение по достижении трёх неудачных попыток без записи в БД.
+- Проверены запросы «предложи дату/время»: вариант не записывается без подтверждения; подтверждения «да, хорошо» и «конечно» принимаются; ввод своего значения заменяет предложение; «нет» отклоняет вариант; «не надо»/«отмена» полностью отменяет операцию.
+- Проверен случай выбора типа записи «напоминание»: первоначально заданная дата и время сохраняются, ответ типа не трактуется как дата.
+- Проверены уточнения создания/переноса, изменение времени при известной дате, отмена, поиск, список активных дел, семантический поиск и SQLite.
+- Архив собирается без `data/assistant.sqlite3`, `.venv`, кэшей моделей и `__pycache__`.
+
+## Ограничения
+
+- Для большей части тестов используются fake LLM/encoder и временная база. Один тест проверяет интеграцию метода предложения модели через подмену метода валидированным кандидатом; реальная генерация предложения Qwen не тестировалась end-to-end в этой среде.
+- Полноценный запуск Qwen, faster-whisper, микрофона и Windows TTS должен быть проверен на целевом Windows-ПК.
+- Публичный репозиторий и веб-прототип не опубликованы.
+- Не реализованы реальные системные уведомления, поиск конфликтов, повторения, календарная интеграция и multi-user.
+
+## Ручная проверка на Windows
+
+1. `Добавь задачу на завтра сходить в парк` — ожидается уточнение времени с форматами `15:30`, `22:00`, `10 часов вечера`.
+2. В ответ отправить `10 часов вечера` — задача должна создаться на завтра в 22:00.
+3. Повторить создание, затем на вопрос о времени ввести `не знаю` трижды — уточнение должно завершиться без записи.
+4. На вопрос о времени ввести `предложи время` — ассистент предложит кандидат. До подтверждения `да`, `да, хорошо` или `конечно` запись не появляется.
+5. На вопрос об ожидаемом времени вместо ответа ввести `покажи активные дела` — ожидающее создание отменяется, выполняется новая команда.
+6. Запросить предложение три раза и ответить `нет` на каждый вариант — после третьего отказа уточнение завершается без записи.
+7. При активном предложении ответить `не надо` — весь незавершённый процесс отменяется.
+6. `Создай купить молоко завтра в 15:00` → ответ `напоминание` — должно создать напоминание на указанную дату/время.
+
+===== VERSION =====
+1.9.1
+
+===== ИЗМЕНЕНИЯ_1_2.txt =====
+Release 1.2 — исправления дат и названий задач
+
+1. Если пользователь явно говорит «сегодня», «завтра» или «послезавтра», дата берётся из исходной фразы и локальных системных часов компьютера, а не из потенциально ошибочной даты, придуманной языковой моделью.
+2. При создании задачи название извлекается из исходной команды: «Добавь задачу на завтра: проверить расписание» -> «Проверить расписание».
+3. Команды «задачи на завтра» распознаются как запрос списка на завтра, даже если языковая модель классифицировала их как поиск.
+4. Если время не указано, для относительной даты используется 09:00. Это текущее явно заданное поведение приложения.
+
+Проверки в рабочей среде:
+- 18/18 автоматических тестов пройдены.
+- compileall завершился без ошибок.
+- Полноценный микрофон и Windows TTS в этой среде не проверялись.
+
+===== ИЗМЕНЕНИЯ_1_3.txt =====
+Release 1.3 — исправления извлечения времени и названия задачи
+
+1. Время ищется во всей исходной фразе, а не только после даты: «на 15 часов, на сегодня сходите на работу» -> сегодня в 15:00.
+2. Поддержаны распространённые обозначения частей дня: «в обед» -> 13:00, «утром» -> 09:00, «вечером» -> 18:00, «ночью» -> 22:00.
+3. Эти временные выражения удаляются из заголовка задачи. Например, «Добавь задачу сегодня в обед, ...» не сохраняет «в обед» в названии.
+4. Добавлены автоматические тесты на указанные случаи.
+
+Проверка: 21/21 автоматических тестов пройдены; compileall пройден.
+Микрофон, Windows TTS и CUDA требуют проверки на целевом ПК.
+
+===== ПЕРЕД_ЗАПУСКОМ.txt =====
+ГОЛОСОВОЙ АССИСТЕНТ — RELEASE 1.9.1
+
+УСТАНОВКА (PowerShell из папки проекта):
+  py -3.13 -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+  python -m pip install --upgrade pip
+  pip install -r requirements.txt
+  python -m unittest discover -s tests -v
+  python main.py
+
+При первом старте скачиваются локальные модели; дождитесь статуса «Готово».
+База создаётся автоматически в data\assistant.sqlite3. Архив не содержит данных пользователя.
+
+МИНИ-ИНСТРУКЦИЯ:
+- Дата: «сегодня», «завтра», «послезавтра», «в пятницу», «26.10.2026».
+- Время: «15:30», «22:00», «22 00», «10 часов вечера», «15 часов 30 минут».
+- Не говорите только «вечером/утром/в обед» — укажите конкретные часы и минуты.
+- Для варианта напишите «предложи дату» или «предложи время». Предложение не применяется до подтверждения: подойдут «да», «да, хорошо», «подходит» или «конечно». Ответ «нет» отвергает только предложенный вариант; «не надо» и «отмена» прекращают операцию.
+- Для отмены незавершённого уточнения введите «отмена». Новая команда тоже может прервать ожидающий вопрос.
+- После трёх ответов, которые нельзя разобрать, или трёх отклонённых предложений незавершённое действие отменяется, данные не записываются.
+- Если STT ошибается, введите ответ текстом в строке ввода.
+
+ОБНОВЛЕНИЕ С СОХРАНЕНИЕМ ЗАПИСЕЙ:
+1) Закройте приложение.
+2) Скопируйте data\assistant.sqlite3 в резервное место.
+3) Распакуйте архив поверх проекта, заменяя файлы кода, но не удаляйте каталог data.
+4) Если распаковали в новую папку, создайте в ней data и скопируйте туда старый assistant.sqlite3.
+5) Активируйте прежнее виртуальное окружение (или установите зависимости), выполните тесты и запустите main.py.
+
+Автоматические тесты используют временную БД и не загружают большие модели.
+Публичная ссылка на веб-прототип пока отсутствует; это локальное desktop-приложение.
+Подробности см. README.md, CHANGELOG.md и TEST_REPORT.md.
+
